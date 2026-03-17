@@ -220,7 +220,7 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum) -> None:
     print(f'Emitted {len(out_poses)} RTK poses, {len(out_aligned)} aligned poses')
 
     # ------------------------------------------------------------------
-    # Phase 3: write output bag
+    # Phase 3: write output bag  (all input topics + new computed ones)
     # ------------------------------------------------------------------
     def make_pose_msg(stamp_ns, frame_id, pos, rot):
         q = rot.as_quat()   # [x, y, z, w]
@@ -290,14 +290,56 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum) -> None:
         print(f'ERROR: output path {out_dir} already exists — remove it first', file=sys.stderr)
         sys.exit(1)
 
+    # Collect all raw messages from input, keyed by topic
+    import hashlib
+    raw_messages = []  # (topic, timestamp, rawdata)
+    input_connections = {}  # topic -> connection
+
+    with Reader(reader_path) as reader:
+        for connection, timestamp, rawdata in reader.messages():
+            raw_messages.append((connection.topic, timestamp, rawdata))
+            if connection.topic not in input_connections:
+                input_connections[connection.topic] = connection
+
+    raw_messages.sort(key=lambda x: x[1])
+
+    # New topics produced by this tool
+    NEW_TOPICS = {
+        '/ov_srvins/rtk/pose',
+        '/ov_srvins/rtk/path',
+        '/ov_srvins/rtk/pose_aligned',
+        '/ov_srvins/rtk/path_aligned',
+    }
+
     with Writer(out_dir, version=9, storage_plugin=StoragePlugin.MCAP) as writer:
+        # Re-register all input connections (except topics we're replacing)
+        passthrough_conns = {}
+        for topic, conn in input_connections.items():
+            if topic in NEW_TOPICS:
+                continue
+            msgdef_str = conn.msgdef[1] if conn.msgdef else ''
+            rihs01 = conn.digest or f'RIHS01_{hashlib.sha256(msgdef_str.encode()).hexdigest()}'
+            passthrough_conns[topic] = writer.add_connection(
+                topic,
+                conn.msgtype,
+                msgdef=msgdef_str,
+                rihs01=rihs01,
+                serialization_format=conn.ext.serialization_format,
+                offered_qos_profiles=conn.ext.offered_qos_profiles,
+            )
+
         conn_pose    = writer.add_connection('/ov_srvins/rtk/pose',         POSE_TYPE, typestore=typestore)
         conn_path    = writer.add_connection('/ov_srvins/rtk/path',         PATH_TYPE, typestore=typestore)
         conn_pose_al = writer.add_connection('/ov_srvins/rtk/pose_aligned', POSE_TYPE, typestore=typestore)
         conn_path_al = writer.add_connection('/ov_srvins/rtk/path_aligned', PATH_TYPE, typestore=typestore)
-        conn_vio     = writer.add_connection(vio_topic,                     POSE_TYPE, typestore=typestore)
 
-        path_poses         = []   # (stamp_ns, pos, rot)
+        # Write all input messages (pass-through)
+        for topic, timestamp, rawdata in raw_messages:
+            if topic in passthrough_conns:
+                writer.write(passthrough_conns[topic], timestamp, rawdata)
+
+        # Write computed RTK poses/paths
+        path_poses         = []
         path_poses_aligned = []
 
         for fix_ts, stamp_ns, pos, rot in out_poses:
@@ -317,8 +359,5 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum) -> None:
 
             writer.write(conn_pose_al, fix_ts, typestore.serialize_cdr(pose_msg, POSE_TYPE))
             writer.write(conn_path_al, fix_ts, typestore.serialize_cdr(path_msg, PATH_TYPE))
-
-        for ts, msg in posimus:
-            writer.write(conn_vio, ts, typestore.serialize_cdr(msg, POSE_TYPE))
 
     print(f'Output bag written to: {out_dir}')
