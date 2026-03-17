@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "bag-tool"
+version = "0.1.0"
+description = "ROS2 bag utility CLI tool"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "rosbags>=0.9",
+    "numpy",
+    "scipy",
+]
+
+[project.scripts]
+bag-tool = "bag_tool.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
