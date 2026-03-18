@@ -107,7 +107,7 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum) -> None:
                 fixes.append((timestamp, msg))
             elif topic == '/m300/rtk/yaw':
                 msg = typestore.deserialize_cdr(rawdata, connection.msgtype)
-                yaws.append((timestamp, msg.data))
+                yaws.append((timestamp, msg.data * 10.0))  # DJI publishes tenths-of-degrees
             elif topic == vio_topic:
                 msg = typestore.deserialize_cdr(rawdata, connection.msgtype)
                 posimus.append((timestamp, msg))
@@ -215,6 +215,14 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum) -> None:
             if prev_q_al_arr is not None and np.dot(q_al_arr, prev_q_al_arr) < 0:
                 q_al_arr = -q_al_arr
             prev_q_al_arr = q_al_arr
+
+            # TODO: TEMPORARY - extra 90° position rotation for axis investigation.
+            # Orientation is left as computed by alignment; only the position vector
+            # is rotated. Do NOT use for production — will be removed once the axis
+            # confusion is understood and fixed properly.
+            _rot90 = Rotation.from_euler('z', -math.pi / 2)
+            p_al = _rot90.apply(p_al)
+
             out_aligned.append((fix_ts, stamp_ns, p_al, Rotation.from_quat(q_al_arr)))
 
     print(f'Emitted {len(out_poses)} RTK poses, {len(out_aligned)} aligned poses')
