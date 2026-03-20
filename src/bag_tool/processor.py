@@ -14,6 +14,7 @@ Writes a new bag with:
 """
 
 import bisect
+import hashlib
 import math
 import sys
 from pathlib import Path
@@ -77,7 +78,7 @@ def nearest_yaw(yaw_times: list, yaw_values: list, query_ns: int) -> float:
 # ---------------------------------------------------------------------------
 # Main processing function
 # ---------------------------------------------------------------------------
-def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum) -> None:
+def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: bool = False) -> None:
     """
     Process input_bag and write output_bag.
 
@@ -95,6 +96,7 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum) -> None:
     fixes   = []   # (timestamp_ns, msg)
     yaws    = []   # (timestamp_ns, yaw_deg)
     posimus = []   # (timestamp_ns, msg)
+    input_connections = {}  # topic -> connection  (collected here, used in Phase 3)
 
     input_path = Path(input_bag)
     reader_path = input_path.parent if input_path.is_file() else input_path
@@ -102,6 +104,8 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum) -> None:
     with Reader(reader_path) as reader:
         for connection, timestamp, rawdata in reader.messages():
             topic = connection.topic
+            if topic not in input_connections:
+                input_connections[topic] = connection
             if topic == '/m300/rtk/fix':
                 msg = typestore.deserialize_cdr(rawdata, connection.msgtype)
                 fixes.append((timestamp, msg))
@@ -298,53 +302,46 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum) -> None:
         print(f'ERROR: output path {out_dir} already exists — remove it first', file=sys.stderr)
         sys.exit(1)
 
-    # Collect all raw messages from input, keyed by topic
-    import hashlib
-    raw_messages = []  # (topic, timestamp, rawdata)
-    input_connections = {}  # topic -> connection
-
-    with Reader(reader_path) as reader:
-        for connection, timestamp, rawdata in reader.messages():
-            raw_messages.append((connection.topic, timestamp, rawdata))
-            if connection.topic not in input_connections:
-                input_connections[connection.topic] = connection
-
-    raw_messages.sort(key=lambda x: x[1])
-
     # New topics produced by this tool
     NEW_TOPICS = {
         '/ov_srvins/rtk/pose',
         '/ov_srvins/rtk/path',
         '/ov_srvins/rtk/pose_aligned',
         '/ov_srvins/rtk/path_aligned',
+        '/ov_srvins/vio/path',
     }
 
     with Writer(out_dir, version=9, storage_plugin=StoragePlugin.MCAP) as writer:
-        # Re-register all input connections (except topics we're replacing)
+        # Re-register input connections to pass through.
+        # In quick mode: skip everything (VIO path is computed, not passed through).
         passthrough_conns = {}
-        for topic, conn in input_connections.items():
-            if topic in NEW_TOPICS:
-                continue
-            msgdef_str = conn.msgdef[1] if conn.msgdef else ''
-            rihs01 = conn.digest or f'RIHS01_{hashlib.sha256(msgdef_str.encode()).hexdigest()}'
-            passthrough_conns[topic] = writer.add_connection(
-                topic,
-                conn.msgtype,
-                msgdef=msgdef_str,
-                rihs01=rihs01,
-                serialization_format=conn.ext.serialization_format,
-                offered_qos_profiles=conn.ext.offered_qos_profiles,
-            )
+        if not quick:
+            for topic, conn in input_connections.items():
+                if topic in NEW_TOPICS:
+                    continue
+                msgdef_str = conn.msgdef[1] if conn.msgdef else ''
+                rihs01 = conn.digest or f'RIHS01_{hashlib.sha256(msgdef_str.encode()).hexdigest()}'
+                passthrough_conns[topic] = writer.add_connection(
+                    topic,
+                    conn.msgtype,
+                    msgdef=msgdef_str,
+                    rihs01=rihs01,
+                    serialization_format=conn.ext.serialization_format,
+                    offered_qos_profiles=conn.ext.offered_qos_profiles,
+                )
 
-        conn_pose    = writer.add_connection('/ov_srvins/rtk/pose',         POSE_TYPE, typestore=typestore)
+        conn_pose    = None if quick else writer.add_connection('/ov_srvins/rtk/pose',         POSE_TYPE, typestore=typestore)
         conn_path    = writer.add_connection('/ov_srvins/rtk/path',         PATH_TYPE, typestore=typestore)
-        conn_pose_al = writer.add_connection('/ov_srvins/rtk/pose_aligned', POSE_TYPE, typestore=typestore)
+        conn_pose_al = None if quick else writer.add_connection('/ov_srvins/rtk/pose_aligned', POSE_TYPE, typestore=typestore)
         conn_path_al = writer.add_connection('/ov_srvins/rtk/path_aligned', PATH_TYPE, typestore=typestore)
+        conn_vio_path = writer.add_connection('/ov_srvins/vio/path',        PATH_TYPE, typestore=typestore) if quick else None
 
-        # Write all input messages (pass-through)
-        for topic, timestamp, rawdata in raw_messages:
-            if topic in passthrough_conns:
-                writer.write(passthrough_conns[topic], timestamp, rawdata)
+        # Stream all input messages (pass-through) — no in-memory buffering
+        with Reader(reader_path) as reader:
+            for connection, timestamp, rawdata in reader.messages():
+                topic = connection.topic
+                if topic in passthrough_conns:
+                    writer.write(passthrough_conns[topic], timestamp, rawdata)
 
         # Write computed RTK poses/paths
         path_poses         = []
@@ -353,19 +350,30 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum) -> None:
         for fix_ts, stamp_ns, pos, rot in out_poses:
             path_poses.append((stamp_ns, pos, rot))
 
-            pose_msg = make_pose_msg(stamp_ns, FRAME_ID, pos, rot)
             path_msg = make_path_msg(stamp_ns, FRAME_ID, path_poses)
-
-            writer.write(conn_pose, fix_ts, typestore.serialize_cdr(pose_msg, POSE_TYPE))
+            if conn_pose:
+                pose_msg = make_pose_msg(stamp_ns, FRAME_ID, pos, rot)
+                writer.write(conn_pose, fix_ts, typestore.serialize_cdr(pose_msg, POSE_TYPE))
             writer.write(conn_path, fix_ts, typestore.serialize_cdr(path_msg, PATH_TYPE))
 
         for fix_ts, stamp_ns, pos, rot in out_aligned:
             path_poses_aligned.append((stamp_ns, pos, rot))
 
-            pose_msg = make_pose_msg(stamp_ns, FRAME_ID, pos, rot)
             path_msg = make_path_msg(stamp_ns, FRAME_ID, path_poses_aligned)
-
-            writer.write(conn_pose_al, fix_ts, typestore.serialize_cdr(pose_msg, POSE_TYPE))
+            if conn_pose_al:
+                pose_msg = make_pose_msg(stamp_ns, FRAME_ID, pos, rot)
+                writer.write(conn_pose_al, fix_ts, typestore.serialize_cdr(pose_msg, POSE_TYPE))
             writer.write(conn_path_al, fix_ts, typestore.serialize_cdr(path_msg, PATH_TYPE))
+
+        if conn_vio_path:
+            vio_path_poses = []
+            for vio_ts, pm in posimus:
+                pos = [pm.pose.pose.position.x, pm.pose.pose.position.y, pm.pose.pose.position.z]
+                rot = Rotation.from_quat([pm.pose.pose.orientation.x, pm.pose.pose.orientation.y,
+                                          pm.pose.pose.orientation.z, pm.pose.pose.orientation.w])
+                stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
+                vio_path_poses.append((stamp_ns, pos, rot))
+                path_msg = make_path_msg(stamp_ns, FRAME_ID, vio_path_poses)
+                writer.write(conn_vio_path, vio_ts, typestore.serialize_cdr(path_msg, PATH_TYPE))
 
     print(f'Output bag written to: {out_dir}')

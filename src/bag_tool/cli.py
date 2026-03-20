@@ -49,6 +49,11 @@ def main() -> None:
         action="store_true",
         help="Always prompt for the VIO topic, ignoring the stored default.",
     )
+    convert_parser.add_argument(
+        "-q", "--quick",
+        action="store_true",
+        help="Only write path topics (skip per-message pose topics).",
+    )
 
     # ---- trim subcommand ----
     trim_parser = subparsers.add_parser(
@@ -87,7 +92,7 @@ def main() -> None:
         print(f"VIO topic   : {vio_topic}")
         print()
 
-        run_convert(args.input_bag, args.output_bag, vio_topic, stores)
+        run_convert(args.input_bag, args.output_bag, vio_topic, stores, quick=args.quick)
 
     elif args.command == "trim":
         print()
