@@ -1,4 +1,4 @@
-"""Re-serialise a bag from Jazzy to Humble message definitions."""
+"""Re-serialise a bag from Humble to Jazzy message definitions."""
 
 from __future__ import annotations
 import sys
@@ -13,7 +13,7 @@ from bag_tool.trim import _rihs01
 
 
 def _add_conn(writer: Writer, conn, typestore: Typestore):
-    """Register a connection using Humble message definitions where available."""
+    """Register a connection using Jazzy message definitions where available."""
     msgtype = conn.msgtype
     if msgtype in typestore.fielddefs:
         msgdef, _ = typestore.generate_msgdef(msgtype, ros_version=2)
@@ -42,8 +42,8 @@ def run(input_bag: str, output_bag: str) -> None:
         print(f'ERROR: output path {out_dir} already exists — remove it first', file=sys.stderr)
         sys.exit(1)
 
-    ts_src  = get_typestore(Stores.ROS2_JAZZY)
-    ts_dst  = get_typestore(Stores.ROS2_HUMBLE)
+    ts_src  = get_typestore(Stores.ROS2_HUMBLE)
+    ts_dst  = get_typestore(Stores.ROS2_JAZZY)
 
     # Pre-compute which message types need re-serialisation (definition differs between stores)
     needs_reserialise: dict[str, bool] = {}
@@ -87,7 +87,7 @@ def run(input_bag: str, output_bag: str) -> None:
     total = sum(counts.values())
     print(f'Wrote {total} messages to {out_dir}')
     if reserialised:
-        print(f'Re-serialised types (Jazzy → Humble):')
+        print('Re-serialised types (Humble → Jazzy):')
         for t in sorted(reserialised):
             print(f'  {t}  ({counts[t]} msgs)')
     else:

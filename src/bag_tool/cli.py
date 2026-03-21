@@ -9,7 +9,7 @@ from bag_tool.ros2_detect import detect_ros2_distro_verbose, detect_stores_enum
 from bag_tool.processor import run as run_convert
 from bag_tool.trim import run as run_trim
 from bag_tool.altimeter import run as run_compare_altimeter
-from bag_tool.convert_humble import run as run_convert_humble
+from bag_tool.convert_jazzy import run as run_convert_jazzy
 
 
 _DEFAULT_VIO_TOPIC = "/ov_srvins/poseimu"
@@ -57,13 +57,13 @@ def main() -> None:
         help="Only write path topics (skip per-message pose topics).",
     )
 
-    # ---- convert-to-humble subcommand ----
-    humble_parser = subparsers.add_parser(
-        "convert-to-humble",
-        help="Re-serialise a Jazzy bag using Humble message definitions (strips Jazzy-added fields).",
+    # ---- convert-to-jazzy subcommand ----
+    jazzy_parser = subparsers.add_parser(
+        "convert-to-jazzy",
+        help="Re-serialise a Humble bag using Jazzy message definitions (adds missing fields with defaults).",
     )
-    humble_parser.add_argument("input_bag",  help="Input bag (.mcap file or directory)")
-    humble_parser.add_argument("output_bag", help="Output bag directory to create")
+    jazzy_parser.add_argument("input_bag",  help="Input bag (.mcap file or directory)")
+    jazzy_parser.add_argument("output_bag", help="Output bag directory to create")
 
     # ---- compare-altimeter subcommand ----
     alt_parser = subparsers.add_parser(
@@ -112,9 +112,9 @@ def main() -> None:
 
         run_convert(args.input_bag, args.output_bag, vio_topic, stores, quick=args.quick)
 
-    elif args.command == "convert-to-humble":
+    elif args.command == "convert-to-jazzy":
         print()
-        run_convert_humble(args.input_bag, args.output_bag)
+        run_convert_jazzy(args.input_bag, args.output_bag)
 
     elif args.command == "compare-altimeter":
         print()
