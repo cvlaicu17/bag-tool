@@ -8,6 +8,7 @@ from bag_tool.config import get_vio_topic, set_vio_topic
 from bag_tool.ros2_detect import detect_ros2_distro_verbose, detect_stores_enum
 from bag_tool.processor import run as run_convert
 from bag_tool.trim import run as run_trim
+from bag_tool.altimeter import run as run_compare_altimeter
 
 
 _DEFAULT_VIO_TOPIC = "/ov_srvins/poseimu"
@@ -55,6 +56,14 @@ def main() -> None:
         help="Only write path topics (skip per-message pose topics).",
     )
 
+    # ---- compare-altimeter subcommand ----
+    alt_parser = subparsers.add_parser(
+        "compare-altimeter",
+        help="Compare altimeter range vs RTK altitude.",
+    )
+    alt_parser.add_argument("input_bag",  help="Input bag (.mcap file or directory)")
+    alt_parser.add_argument("output_bag", help="Output bag directory to create")
+
     # ---- trim subcommand ----
     trim_parser = subparsers.add_parser(
         "trim",
@@ -93,6 +102,10 @@ def main() -> None:
         print()
 
         run_convert(args.input_bag, args.output_bag, vio_topic, stores, quick=args.quick)
+
+    elif args.command == "compare-altimeter":
+        print()
+        run_compare_altimeter(args.input_bag, args.output_bag)
 
     elif args.command == "trim":
         print()
