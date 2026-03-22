@@ -10,6 +10,7 @@ from bag_tool.processor import run as run_convert
 from bag_tool.trim import run as run_trim
 from bag_tool.altimeter import run as run_compare_altimeter
 from bag_tool.convert_jazzy import run as run_convert_jazzy
+from bag_tool.add_topics import run as run_add_topics
 
 
 _DEFAULT_VIO_TOPIC = "/ov_srvins/poseimu"
@@ -73,6 +74,15 @@ def main() -> None:
     alt_parser.add_argument("input_bag",  help="Input bag (.mcap file or directory)")
     alt_parser.add_argument("output_bag", help="Output bag directory to create")
 
+    # ---- add-topics subcommand ----
+    addtopics_parser = subparsers.add_parser(
+        "add-topics",
+        help="Append topics from a source bag into an existing dest bag (in-place).",
+    )
+    addtopics_parser.add_argument("source_bag", help="Source bag to read topics FROM")
+    addtopics_parser.add_argument("dest_bag",   help="Existing bag to append topics INTO")
+    addtopics_parser.add_argument("topics", nargs="+", help="Topic name(s) to copy")
+
     # ---- trim subcommand ----
     trim_parser = subparsers.add_parser(
         "trim",
@@ -119,6 +129,10 @@ def main() -> None:
     elif args.command == "compare-altimeter":
         print()
         run_compare_altimeter(args.input_bag, args.output_bag)
+
+    elif args.command == "add-topics":
+        print()
+        run_add_topics(args.source_bag, args.dest_bag, args.topics)
 
     elif args.command == "trim":
         print()
