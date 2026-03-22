@@ -360,21 +360,23 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
 
         else:
             # Growing path message at every fix timestamp
-            path_poses = []
-            for fix_ts, stamp_ns, pos, rot in out_poses:
-                path_poses.append((stamp_ns, pos, rot))
+            rtk_buf = bytearray()
+            for k, (fix_ts, stamp_ns, pos, rot) in enumerate(out_poses, 1):
+                q = rot.as_quat()
+                rtk_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
                 writer.write(conn_pose, fix_ts, typestore.serialize_cdr(
                     make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
-                writer.write(conn_path, fix_ts, typestore.serialize_cdr(
-                    make_path_msg(stamp_ns, FRAME_ID, path_poses), PATH_TYPE))
+                writer.write(conn_path, fix_ts,
+                             _path_header_cdr(stamp_ns, k) + bytes(rtk_buf))
 
-            path_poses_al = []
-            for fix_ts, stamp_ns, pos, rot in out_aligned:
-                path_poses_al.append((stamp_ns, pos, rot))
+            al_buf = bytearray()
+            for k, (fix_ts, stamp_ns, pos, rot) in enumerate(out_aligned, 1):
+                q = rot.as_quat()
+                al_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
                 writer.write(conn_pose_al, fix_ts, typestore.serialize_cdr(
                     make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
-                writer.write(conn_path_al, fix_ts, typestore.serialize_cdr(
-                    make_path_msg(stamp_ns, FRAME_ID, path_poses_al), PATH_TYPE))
+                writer.write(conn_path_al, fix_ts,
+                             _path_header_cdr(stamp_ns, k) + bytes(al_buf))
 
             pose_buf = bytearray()
             for k, (vio_ts, pm) in enumerate(posimus, 1):
