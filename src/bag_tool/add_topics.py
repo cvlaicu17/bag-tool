@@ -245,6 +245,11 @@ def run(source_bag: str, dest_bag: str, topics: list[str]) -> None:
                 write_uint64(ci_rec, len(raw_chunk))              # uncompressed_size
                 new_chunk_indexes.append(ci_rec)
 
+        # DataEnd(0x0F) — required by MCAP spec to close the data section
+        de = BytesIO()
+        write_uint32(de, 0)
+        write_record(bio, 0x0F, de)
+
         # Write summary section
         new_summary_start = bio.tell()
 
