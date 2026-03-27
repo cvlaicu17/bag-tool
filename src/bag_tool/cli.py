@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import argparse
+from pathlib import Path
 
 from bag_tool import __version__
 from bag_tool.config import get_vio_topic, set_vio_topic
@@ -11,6 +12,7 @@ from bag_tool.trim import run as run_trim
 from bag_tool.altimeter import run as run_compare_altimeter
 from bag_tool.convert_jazzy import run as run_convert_jazzy
 from bag_tool.add_topics import run as run_add_topics
+from bag_tool.align import run as run_align
 
 
 _DEFAULT_VIO_TOPIC = "/ov_srvins/poseimu"
@@ -46,7 +48,8 @@ def main() -> None:
         help="RTK → ENU pose converter and VIO alignment.",
     )
     convert_parser.add_argument("input_bag",  help="Input bag (.mcap file or directory)")
-    convert_parser.add_argument("output_bag", help="Output bag directory to create")
+    convert_parser.add_argument("output_bag", nargs="?", default=None,
+                                help="Output bag directory to create (default: <input_bag>_aligned)")
     convert_parser.add_argument(
         "-n", "--new-topic",
         action="store_true",
@@ -74,6 +77,24 @@ def main() -> None:
     alt_parser.add_argument("input_bag",  help="Input bag (.mcap file or directory)")
     alt_parser.add_argument("output_bag", help="Output bag directory to create")
 
+    # ---- align subcommand ----
+    align_parser = subparsers.add_parser(
+        "align",
+        help="Compute RTK-VIO alignment and merge with dest bag topics in one pass.",
+    )
+    align_parser.add_argument("input_bag", help="Bag with RTK + VIO data (alignment source)")
+    align_parser.add_argument("dest_bag",  help="Bag whose topics are carried into the output")
+    align_parser.add_argument(
+        "-n", "--new-topic",
+        action="store_true",
+        help="Always prompt for the VIO topic, ignoring the stored default.",
+    )
+    align_parser.add_argument(
+        "-q", "--quick",
+        action="store_true",
+        help="Only write path topics (skip per-message pose topics).",
+    )
+
     # ---- add-topics subcommand ----
     addtopics_parser = subparsers.add_parser(
         "add-topics",
@@ -81,7 +102,7 @@ def main() -> None:
     )
     addtopics_parser.add_argument("source_bag", help="Source bag to read topics FROM")
     addtopics_parser.add_argument("dest_bag",   help="Existing bag to append topics INTO")
-    addtopics_parser.add_argument("topics", nargs="+", help="Topic name(s) to copy")
+    addtopics_parser.add_argument("topics", nargs="*", help="Topic name(s) to copy (default: all topics in source bag)")
 
     # ---- trim subcommand ----
     trim_parser = subparsers.add_parser(
@@ -120,7 +141,9 @@ def main() -> None:
         print(f"VIO topic   : {vio_topic}")
         print()
 
-        run_convert(args.input_bag, args.output_bag, vio_topic, stores, quick=args.quick)
+        input_path = Path(args.input_bag)
+        output_bag = args.output_bag or str(input_path.parent / (input_path.name + '_aligned'))
+        run_convert(args.input_bag, output_bag, vio_topic, stores, quick=args.quick)
 
     elif args.command == "convert-to-jazzy":
         print()
@@ -129,6 +152,25 @@ def main() -> None:
     elif args.command == "compare-altimeter":
         print()
         run_compare_altimeter(args.input_bag, args.output_bag)
+
+    elif args.command == "align":
+        details = detect_ros2_distro_verbose()
+        stores  = detect_stores_enum()
+        print(f"Detected OS : Ubuntu {details['ubuntu_version']} ({details['ubuntu_codename']})")
+        print(f"ROS2 distro : {details['ros2_distro']}")
+        print()
+
+        stored = get_vio_topic()
+        if args.new_topic or stored is None:
+            vio_topic = _ask_vio_topic(stored or _DEFAULT_VIO_TOPIC)
+            set_vio_topic(vio_topic)
+        else:
+            vio_topic = stored
+
+        print(f"VIO topic   : {vio_topic}")
+        print()
+
+        run_align(args.input_bag, args.dest_bag, vio_topic, stores, quick=args.quick)
 
     elif args.command == "add-topics":
         print()

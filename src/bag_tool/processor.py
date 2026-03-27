@@ -25,6 +25,8 @@ from rosbags.rosbag2.writer import StoragePlugin
 from rosbags.typesys import get_typestore
 from scipy.spatial.transform import Rotation
 
+from bag_tool.add_topics import _normalize_msgdef
+
 # ---------------------------------------------------------------------------
 # Fast CDR helpers for nav_msgs/Path with frame_id="global"
 #
@@ -102,43 +104,53 @@ def nearest_yaw(yaw_times: list, yaw_values: list, query_ns: int) -> float:
     return yaw_values[idx]
 
 
-# ---------------------------------------------------------------------------
-# Main processing function
-# ---------------------------------------------------------------------------
-def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: bool = False) -> None:
-    """
-    Process input_bag and write output_bag.
+# Topics written by compute_alignment / write_alignment_topics.
+# Used to exclude them from passthrough when the source bag is also the input bag.
+COMPUTED_TOPICS = frozenset({
+    '/ov_srvins/rtk/pose',
+    '/ov_srvins/rtk/path',
+    '/ov_srvins/rtk/pose_aligned',
+    '/ov_srvins/rtk/path_aligned',
+    '/ov_srvins/vio/path',
+})
 
-    Args:
-        input_bag:   Path to input bag (.mcap file or directory).
-        output_bag:  Path to output bag directory to create.
-        vio_topic:   ROS2 topic name for PoseWithCovarianceStamped VIO messages.
-        stores_enum: rosbags Stores enum value matching the ROS2 distro.
+
+# ---------------------------------------------------------------------------
+# Phase 1 + 2: load RTK/VIO data and compute poses (no I/O side-effects)
+# ---------------------------------------------------------------------------
+def compute_alignment(
+    input_bag: str,
+    vio_topic: str,
+    stores_enum,
+) -> tuple:
+    """Load RTK/VIO data from input_bag and compute ENU + aligned poses.
+
+    Returns (out_poses, out_aligned, posimus, typestore, reader_path).
+    out_poses   : list of (fix_ts, stamp_ns, enu_pos, rot)   — raw ENU
+    out_aligned : list of (fix_ts, stamp_ns, pos_al, rot_al) — VIO-aligned
+    posimus     : list of (timestamp_ns, msg)                — raw VIO poses
+    typestore   : rosbags typestore (needed for Phase 3 serialisation)
+    reader_path : Path that was opened (for Phase 4 passthrough in convert)
     """
     typestore = get_typestore(stores_enum)
 
-    # ------------------------------------------------------------------
-    # Phase 1: load all messages from input bag
-    # ------------------------------------------------------------------
-    fixes   = []   # (timestamp_ns, msg)
-    yaws    = []   # (timestamp_ns, yaw_deg)
-    posimus = []   # (timestamp_ns, msg)
+    fixes   = []
+    yaws    = []
+    posimus = []
 
-    input_path = Path(input_bag)
+    input_path  = Path(input_bag)
     reader_path = input_path.parent if input_path.is_file() else input_path
 
     with Reader(reader_path) as reader:
         for connection, timestamp, rawdata in reader.messages():
             topic = connection.topic
             if topic == '/m300/rtk/fix':
-                msg = typestore.deserialize_cdr(rawdata, connection.msgtype)
-                fixes.append((timestamp, msg))
+                fixes.append((timestamp, typestore.deserialize_cdr(rawdata, connection.msgtype)))
             elif topic == '/m300/rtk/yaw':
                 msg = typestore.deserialize_cdr(rawdata, connection.msgtype)
                 yaws.append((timestamp, msg.data * 10.0))  # DJI publishes tenths-of-degrees
             elif topic == vio_topic:
-                msg = typestore.deserialize_cdr(rawdata, connection.msgtype)
-                posimus.append((timestamp, msg))
+                posimus.append((timestamp, typestore.deserialize_cdr(rawdata, connection.msgtype)))
 
     fixes.sort(key=lambda x: x[0])
     yaws.sort(key=lambda x: x[0])
@@ -157,8 +169,7 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
     print(f'Loaded {len(fixes)} fixes, {len(yaws)} yaw msgs, {len(posimus)} poseimu msgs')
 
     # VIO init from first poseimu message
-    vio_init_pos = None
-    vio_init_rot = None
+    vio_init_pos = vio_init_rot = None
     if posimus:
         _, pm = posimus[0]
         vio_init_pos = np.array([pm.pose.pose.position.x,
@@ -169,51 +180,41 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
                                             pm.pose.pose.orientation.z,
                                             pm.pose.pose.orientation.w])
 
-    # ------------------------------------------------------------------
-    # Phase 2: process fixes
-    # ------------------------------------------------------------------
+    # Phase 2: process fixes → ENU poses + aligned poses
     ref_lat = ref_lon = ref_alt = None
     ref_ecef = None
-    pose_offset = None
-    rtk_init_rot = None
-    align_rot = None
-    align_trans = None
-
-    out_poses   = []   # (timestamp_ns, header_stamp_ns, pos, rot)  raw ENU
-    out_aligned = []   # (timestamp_ns, header_stamp_ns, pos, rot)  aligned
-
-    # Previous quaternion arrays [x,y,z,w] for sign-continuity enforcement
+    pose_offset   = None
+    rtk_init_rot  = None
+    align_rot     = None
+    align_trans   = None
     prev_q_arr    = None
     prev_q_al_arr = None
+
+    out_poses   = []
+    out_aligned = []
 
     for fix_ts, fix_msg in fixes:
         lat = fix_msg.latitude
         lon = fix_msg.longitude
         alt = fix_msg.altitude
 
-        # Drop DJI startup garbage
         if lat == 0.0 and lon == 0.0:
             continue
 
-        # First valid fix → set ENU reference, do not emit a pose
         if ref_lat is None:
             ref_lat, ref_lon, ref_alt = lat, lon, alt
             ref_ecef = geodetic_to_ecef(lat, lon, alt)
             print(f'ENU origin set: lat={lat:.7f} lon={lon:.7f} alt={alt:.3f}')
             continue
 
-        # Subsequent fixes → compute ENU
         cx, cy, cz = geodetic_to_ecef(lat, lon, alt)
         dx, dy, dz = cx - ref_ecef[0], cy - ref_ecef[1], cz - ref_ecef[2]
         enu = ecef_to_enu(dx, dy, dz, ref_lat, ref_lon)
 
-        # Zero the starting position
         if pose_offset is None:
             pose_offset = enu.copy()
         enu = enu - pose_offset
 
-        # Build orientation (roll=pitch=0, yaw from RTK).
-        # Enforce sign continuity to prevent 180° flicker from quaternion double-cover.
         yaw_deg = nearest_yaw(yaw_times, yaw_values, fix_ts)
         yaw_rad = dji_yaw_to_enu_rad(yaw_deg)
         q_arr = Rotation.from_euler('z', yaw_rad).as_quat()
@@ -222,7 +223,6 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
         prev_q_arr = q_arr
         rot = Rotation.from_quat(q_arr)
 
-        # Capture RTK init orientation for alignment (first emitted pose is at 0,0,0)
         if rtk_init_rot is None:
             rtk_init_rot = rot
             if vio_init_rot is not None:
@@ -230,7 +230,6 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
                 align_trans = vio_init_pos
                 print('RTK↔VIO alignment computed')
 
-        # Header stamp: use the fix header if available, otherwise bag timestamp
         hdr_sec  = fix_msg.header.stamp.sec
         hdr_nsec = fix_msg.header.stamp.nanosec
         stamp_ns = hdr_sec * 10**9 + hdr_nsec if (hdr_sec or hdr_nsec) else fix_ts
@@ -254,28 +253,39 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
             out_aligned.append((fix_ts, stamp_ns, p_al, Rotation.from_quat(q_al_arr)))
 
     print(f'Emitted {len(out_poses)} RTK poses, {len(out_aligned)} aligned poses')
+    return out_poses, out_aligned, posimus, typestore, reader_path
 
-    # ------------------------------------------------------------------
-    # Phase 3: write output bag  (all input topics + new computed ones)
-    # ------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Phase 3: register computed connections on an open Writer and write messages
+# ---------------------------------------------------------------------------
+def write_alignment_topics(
+    writer,
+    typestore,
+    out_poses: list,
+    out_aligned: list,
+    posimus: list,
+    quick: bool,
+) -> None:
+    """Register the 5 computed alignment connections and write all their messages."""
+
+    FRAME_ID  = 'global'
+    POSE_TYPE = 'geometry_msgs/msg/PoseWithCovarianceStamped'
+    PATH_TYPE = 'nav_msgs/msg/Path'
+
     def make_pose_msg(stamp_ns, frame_id, pos, rot):
-        q = rot.as_quat()   # [x, y, z, w]
+        q = rot.as_quat()
         PoseWithCovStamped = typestore.types['geometry_msgs/msg/PoseWithCovarianceStamped']
-        Header = typestore.types['std_msgs/msg/Header']
-        Time   = typestore.types['builtin_interfaces/msg/Time']
-        Pose   = typestore.types['geometry_msgs/msg/Pose']
+        Header      = typestore.types['std_msgs/msg/Header']
+        Time        = typestore.types['builtin_interfaces/msg/Time']
+        Pose        = typestore.types['geometry_msgs/msg/Pose']
         PoseWithCov = typestore.types['geometry_msgs/msg/PoseWithCovariance']
-        Point  = typestore.types['geometry_msgs/msg/Point']
-        Quat   = typestore.types['geometry_msgs/msg/Quaternion']
-
+        Point       = typestore.types['geometry_msgs/msg/Point']
+        Quat        = typestore.types['geometry_msgs/msg/Quaternion']
         sec  = int(stamp_ns // 10**9)
         nsec = int(stamp_ns %  10**9)
-
         return PoseWithCovStamped(
-            header=Header(
-                stamp=Time(sec=sec, nanosec=nsec),
-                frame_id=frame_id,
-            ),
+            header=Header(stamp=Time(sec=sec, nanosec=nsec), frame_id=frame_id),
             pose=PoseWithCov(
                 pose=Pose(
                     position=Point(x=float(pos[0]), y=float(pos[1]), z=float(pos[2])),
@@ -287,17 +297,15 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
         )
 
     def make_path_msg(stamp_ns, frame_id, poses_so_far):
-        Path_        = typestore.types['nav_msgs/msg/Path']
-        PoseStamped  = typestore.types['geometry_msgs/msg/PoseStamped']
-        Header       = typestore.types['std_msgs/msg/Header']
-        Time         = typestore.types['builtin_interfaces/msg/Time']
-        Pose         = typestore.types['geometry_msgs/msg/Pose']
-        Point        = typestore.types['geometry_msgs/msg/Point']
-        Quat         = typestore.types['geometry_msgs/msg/Quaternion']
-
+        Path_       = typestore.types['nav_msgs/msg/Path']
+        PoseStamped = typestore.types['geometry_msgs/msg/PoseStamped']
+        Header      = typestore.types['std_msgs/msg/Header']
+        Time        = typestore.types['builtin_interfaces/msg/Time']
+        Pose        = typestore.types['geometry_msgs/msg/Pose']
+        Point       = typestore.types['geometry_msgs/msg/Point']
+        Quat        = typestore.types['geometry_msgs/msg/Quaternion']
         sec  = int(stamp_ns // 10**9)
         nsec = int(stamp_ns %  10**9)
-
         pose_list = []
         for ps_stamp_ns, pos, rot in poses_so_far:
             q = rot.as_quat()
@@ -311,15 +319,77 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
                                      z=float(q[2]), w=float(q[3])),
                 ),
             ))
-
         return Path_(
             header=Header(stamp=Time(sec=sec, nanosec=nsec), frame_id=frame_id),
             poses=pose_list,
         )
 
-    FRAME_ID  = 'global'
-    POSE_TYPE = 'geometry_msgs/msg/PoseWithCovarianceStamped'
-    PATH_TYPE = 'nav_msgs/msg/Path'
+    conn_pose    = None if quick else writer.add_connection('/ov_srvins/rtk/pose',         POSE_TYPE, typestore=typestore)
+    conn_path    = writer.add_connection('/ov_srvins/rtk/path',         PATH_TYPE, typestore=typestore)
+    conn_pose_al = None if quick else writer.add_connection('/ov_srvins/rtk/pose_aligned', POSE_TYPE, typestore=typestore)
+    conn_path_al = writer.add_connection('/ov_srvins/rtk/path_aligned', PATH_TYPE, typestore=typestore)
+    conn_vio_path = writer.add_connection('/ov_srvins/vio/path',        PATH_TYPE, typestore=typestore)
+
+    if quick:
+        if out_poses:
+            path_poses = [(stamp_ns, pos, rot) for _, stamp_ns, pos, rot in out_poses]
+            first_ts, first_stamp_ns = out_poses[0][0], out_poses[0][1]
+            writer.write(conn_path, first_ts, typestore.serialize_cdr(
+                make_path_msg(first_stamp_ns, FRAME_ID, path_poses), PATH_TYPE))
+
+        if out_aligned:
+            path_poses_al = [(stamp_ns, pos, rot) for _, stamp_ns, pos, rot in out_aligned]
+            first_ts_al, first_stamp_ns_al = out_aligned[0][0], out_aligned[0][1]
+            writer.write(conn_path_al, first_ts_al, typestore.serialize_cdr(
+                make_path_msg(first_stamp_ns_al, FRAME_ID, path_poses_al), PATH_TYPE))
+
+        if posimus:
+            vio_path_poses = []
+            for vio_ts, pm in posimus:
+                pos = [pm.pose.pose.position.x, pm.pose.pose.position.y, pm.pose.pose.position.z]
+                rot = Rotation.from_quat([pm.pose.pose.orientation.x, pm.pose.pose.orientation.y,
+                                          pm.pose.pose.orientation.z, pm.pose.pose.orientation.w])
+                stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
+                vio_path_poses.append((stamp_ns, pos, rot))
+            writer.write(conn_vio_path, posimus[0][0], typestore.serialize_cdr(
+                make_path_msg(vio_path_poses[0][0], FRAME_ID, vio_path_poses), PATH_TYPE))
+
+    else:
+        rtk_buf = bytearray()
+        for k, (fix_ts, stamp_ns, pos, rot) in enumerate(out_poses, 1):
+            q = rot.as_quat()
+            rtk_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
+            writer.write(conn_pose, fix_ts, typestore.serialize_cdr(
+                make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
+            writer.write(conn_path, fix_ts,
+                         _path_header_cdr(stamp_ns, k) + bytes(rtk_buf))
+
+        al_buf = bytearray()
+        for k, (fix_ts, stamp_ns, pos, rot) in enumerate(out_aligned, 1):
+            q = rot.as_quat()
+            al_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
+            writer.write(conn_pose_al, fix_ts, typestore.serialize_cdr(
+                make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
+            writer.write(conn_path_al, fix_ts,
+                         _path_header_cdr(stamp_ns, k) + bytes(al_buf))
+
+        pose_buf = bytearray()
+        for k, (vio_ts, pm) in enumerate(posimus, 1):
+            stamp_ns = pm.header.stamp.sec * 10 ** 9 + pm.header.stamp.nanosec
+            pos = (pm.pose.pose.position.x, pm.pose.pose.position.y, pm.pose.pose.position.z)
+            q   = (pm.pose.pose.orientation.x, pm.pose.pose.orientation.y,
+                   pm.pose.pose.orientation.z, pm.pose.pose.orientation.w)
+            pose_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
+            writer.write(conn_vio_path, vio_ts,
+                         _path_header_cdr(stamp_ns, k) + bytes(pose_buf))
+
+
+# ---------------------------------------------------------------------------
+# convert: write computed topics + passthrough of input bag topics
+# ---------------------------------------------------------------------------
+def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: bool = False) -> None:
+    out_poses, out_aligned, posimus, typestore, reader_path = \
+        compute_alignment(input_bag, vio_topic, stores_enum)
 
     out_dir = Path(output_bag)
     if out_dir.exists():
@@ -327,65 +397,27 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
         sys.exit(1)
 
     with Writer(out_dir, version=9, storage_plugin=StoragePlugin.MCAP) as writer:
-        conn_pose    = None if quick else writer.add_connection('/ov_srvins/rtk/pose',         POSE_TYPE, typestore=typestore)
-        conn_path    = writer.add_connection('/ov_srvins/rtk/path',         PATH_TYPE, typestore=typestore)
-        conn_pose_al = None if quick else writer.add_connection('/ov_srvins/rtk/pose_aligned', POSE_TYPE, typestore=typestore)
-        conn_path_al = writer.add_connection('/ov_srvins/rtk/path_aligned', PATH_TYPE, typestore=typestore)
-        conn_vio_path = writer.add_connection('/ov_srvins/vio/path',        PATH_TYPE, typestore=typestore)
+        write_alignment_topics(writer, typestore, out_poses, out_aligned, posimus, quick)
 
-        if quick:
-            # Single path message per topic (all poses at once)
-            if out_poses:
-                path_poses = [(stamp_ns, pos, rot) for _, stamp_ns, pos, rot in out_poses]
-                first_ts, first_stamp_ns = out_poses[0][0], out_poses[0][1]
-                writer.write(conn_path, first_ts, typestore.serialize_cdr(
-                    make_path_msg(first_stamp_ns, FRAME_ID, path_poses), PATH_TYPE))
-
-            if out_aligned:
-                path_poses_al = [(stamp_ns, pos, rot) for _, stamp_ns, pos, rot in out_aligned]
-                first_ts_al, first_stamp_ns_al = out_aligned[0][0], out_aligned[0][1]
-                writer.write(conn_path_al, first_ts_al, typestore.serialize_cdr(
-                    make_path_msg(first_stamp_ns_al, FRAME_ID, path_poses_al), PATH_TYPE))
-
-            if conn_vio_path and posimus:
-                vio_path_poses = []
-                for vio_ts, pm in posimus:
-                    pos = [pm.pose.pose.position.x, pm.pose.pose.position.y, pm.pose.pose.position.z]
-                    rot = Rotation.from_quat([pm.pose.pose.orientation.x, pm.pose.pose.orientation.y,
-                                              pm.pose.pose.orientation.z, pm.pose.pose.orientation.w])
-                    stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
-                    vio_path_poses.append((stamp_ns, pos, rot))
-                writer.write(conn_vio_path, posimus[0][0], typestore.serialize_cdr(
-                    make_path_msg(vio_path_poses[0][0], FRAME_ID, vio_path_poses), PATH_TYPE))
-
-        else:
-            # Growing path message at every fix timestamp
-            rtk_buf = bytearray()
-            for k, (fix_ts, stamp_ns, pos, rot) in enumerate(out_poses, 1):
-                q = rot.as_quat()
-                rtk_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
-                writer.write(conn_pose, fix_ts, typestore.serialize_cdr(
-                    make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
-                writer.write(conn_path, fix_ts,
-                             _path_header_cdr(stamp_ns, k) + bytes(rtk_buf))
-
-            al_buf = bytearray()
-            for k, (fix_ts, stamp_ns, pos, rot) in enumerate(out_aligned, 1):
-                q = rot.as_quat()
-                al_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
-                writer.write(conn_pose_al, fix_ts, typestore.serialize_cdr(
-                    make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
-                writer.write(conn_path_al, fix_ts,
-                             _path_header_cdr(stamp_ns, k) + bytes(al_buf))
-
-            pose_buf = bytearray()
-            for k, (vio_ts, pm) in enumerate(posimus, 1):
-                stamp_ns = pm.header.stamp.sec * 10 ** 9 + pm.header.stamp.nanosec
-                pos = (pm.pose.pose.position.x, pm.pose.pose.position.y, pm.pose.pose.position.z)
-                q   = (pm.pose.pose.orientation.x, pm.pose.pose.orientation.y,
-                       pm.pose.pose.orientation.z, pm.pose.pose.orientation.w)
-                pose_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
-                writer.write(conn_vio_path, vio_ts,
-                             _path_header_cdr(stamp_ns, k) + bytes(pose_buf))
+        # Phase 4: copy all remaining source topics as raw bytes
+        with Reader(reader_path) as src_reader:
+            src_conn_map: dict[int, object] = {}
+            for c in src_reader.connections:
+                if c.topic in COMPUTED_TOPICS:
+                    continue
+                msgdef = _normalize_msgdef(
+                    c.msgdef.data if isinstance(c.msgdef.data, str) else c.msgdef.data.decode()
+                )
+                src_conn_map[c.id] = writer.add_connection(
+                    c.topic, c.msgtype,
+                    msgdef=msgdef,
+                    rihs01=c.digest or 'rihs01:' + '0' * 64,
+                    serialization_format=c.ext.serialization_format,
+                    offered_qos_profiles=c.ext.offered_qos_profiles,
+                )
+            passthrough_conns = [c for c in src_reader.connections if c.id in src_conn_map]
+            for c, ts, rawdata in src_reader.messages(connections=passthrough_conns):
+                writer.write(src_conn_map[c.id], ts, rawdata)
+        print(f'Copied {len(src_conn_map)} source topics into output')
 
     print(f'Output bag written to: {out_dir}')
