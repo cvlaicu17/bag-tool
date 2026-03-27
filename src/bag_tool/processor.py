@@ -13,7 +13,6 @@ Writes a new bag with:
   /ov_srvins/rtk/path_aligned  nav_msgs/Path
 """
 
-import bisect
 import math
 import struct
 import sys
@@ -39,6 +38,7 @@ from bag_tool.add_topics import _normalize_msgdef
 _ENCAP        = b'\x00\x01\x00\x00'
 _PATH_FID     = b'\x07\x00\x00\x00global\x00\x00'            # len(4) + "global\0"(7) + pad(1) = 12
 _POSE_FID_PAD = b'\x07\x00\x00\x00global\x00\x00\x00\x00\x00\x00'  # len(4) + "global\0"(7) + pad(5) = 16
+_ALIGN_POS_ROT = Rotation.from_euler('z', -math.pi / 2)
 
 
 def _path_header_cdr(stamp_ns: int, n_poses: int) -> bytes:
@@ -90,20 +90,6 @@ def dji_yaw_to_enu_rad(yaw_deg: float) -> float:
     return math.radians(90.0 - yaw_deg)
 
 
-def nearest_yaw(yaw_times: list, yaw_values: list, query_ns: int) -> float:
-    """Return the yaw value whose timestamp is closest to query_ns."""
-    idx = bisect.bisect_left(yaw_times, query_ns)
-    if idx == 0:
-        return yaw_values[0]
-    if idx >= len(yaw_times):
-        return yaw_values[-1]
-    before = yaw_times[idx - 1]
-    after  = yaw_times[idx]
-    if (query_ns - before) <= (after - query_ns):
-        return yaw_values[idx - 1]
-    return yaw_values[idx]
-
-
 # Topics written by compute_alignment / write_alignment_topics.
 # Used to exclude them from passthrough when the source bag is also the input bag.
 COMPUTED_TOPICS = frozenset({
@@ -125,12 +111,14 @@ def compute_alignment(
 ) -> tuple:
     """Load RTK/VIO data from input_bag and compute ENU + aligned poses.
 
-    Returns (out_poses, out_aligned, posimus, typestore, reader_path).
+    Returns (out_poses, out_aligned, posimus, typestore, reader_path,
+             input_start_ns, input_end_ns).
     out_poses   : list of (fix_ts, stamp_ns, enu_pos, rot)   — raw ENU
     out_aligned : list of (fix_ts, stamp_ns, pos_al, rot_al) — VIO-aligned
     posimus     : list of (timestamp_ns, msg)                — raw VIO poses
     typestore   : rosbags typestore (needed for Phase 3 serialisation)
     reader_path : Path that was opened (for Phase 4 passthrough in convert)
+    input_start_ns/input_end_ns : bag time bounds (for align timestamp-offset detection)
     """
     typestore = get_typestore(stores_enum)
 
@@ -142,7 +130,16 @@ def compute_alignment(
     reader_path = input_path.parent if input_path.is_file() else input_path
 
     with Reader(reader_path) as reader:
-        for connection, timestamp, rawdata in reader.messages():
+        input_start_ns = reader.start_time
+        input_end_ns = reader.start_time + reader.duration
+
+        relevant_connections = [
+            connection
+            for connection in reader.connections
+            if connection.topic in {'/m300/rtk/fix', '/m300/rtk/yaw', vio_topic}
+        ]
+
+        for connection, timestamp, rawdata in reader.messages(connections=relevant_connections):
             topic = connection.topic
             if topic == '/m300/rtk/fix':
                 fixes.append((timestamp, typestore.deserialize_cdr(rawdata, connection.msgtype)))
@@ -156,11 +153,12 @@ def compute_alignment(
     yaws.sort(key=lambda x: x[0])
     posimus.sort(key=lambda x: x[0])
 
-    yaw_times  = [t for t, _ in yaws]
-    yaw_values = [v for _, v in yaws]
-
     if not fixes:
         print('ERROR: no /m300/rtk/fix messages found in bag', file=sys.stderr)
+        sys.exit(1)
+
+    if not yaws:
+        print('ERROR: no /m300/rtk/yaw messages found in bag', file=sys.stderr)
         sys.exit(1)
 
     if not posimus:
@@ -192,6 +190,8 @@ def compute_alignment(
 
     out_poses   = []
     out_aligned = []
+    yaw_idx = 0
+    last_yaw_idx = len(yaws) - 1
 
     for fix_ts, fix_msg in fixes:
         lat = fix_msg.latitude
@@ -215,7 +215,21 @@ def compute_alignment(
             pose_offset = enu.copy()
         enu = enu - pose_offset
 
-        yaw_deg = nearest_yaw(yaw_times, yaw_values, fix_ts)
+        while yaw_idx < last_yaw_idx and yaws[yaw_idx + 1][0] <= fix_ts:
+            yaw_idx += 1
+
+        if fix_ts <= yaws[0][0]:
+            yaw_deg = yaws[0][1]
+        elif yaw_idx >= last_yaw_idx:
+            yaw_deg = yaws[last_yaw_idx][1]
+        else:
+            before_ts, before_yaw = yaws[yaw_idx]
+            after_ts, after_yaw = yaws[yaw_idx + 1]
+            if (fix_ts - before_ts) <= (after_ts - fix_ts):
+                yaw_deg = before_yaw
+            else:
+                yaw_deg = after_yaw
+
         yaw_rad = dji_yaw_to_enu_rad(yaw_deg)
         q_arr = Rotation.from_euler('z', yaw_rad).as_quat()
         if prev_q_arr is not None and np.dot(q_arr, prev_q_arr) < 0:
@@ -247,13 +261,12 @@ def compute_alignment(
             # Orientation is left as computed by alignment; only the position vector
             # is rotated. Do NOT use for production — will be removed once the axis
             # confusion is understood and fixed properly.
-            _rot90 = Rotation.from_euler('z', -math.pi / 2)
-            p_al = _rot90.apply(p_al)
+            p_al = _ALIGN_POS_ROT.apply(p_al)
 
             out_aligned.append((fix_ts, stamp_ns, p_al, Rotation.from_quat(q_al_arr)))
 
     print(f'Emitted {len(out_poses)} RTK poses, {len(out_aligned)} aligned poses')
-    return out_poses, out_aligned, posimus, typestore, reader_path
+    return out_poses, out_aligned, posimus, typestore, reader_path, input_start_ns, input_end_ns
 
 
 # ---------------------------------------------------------------------------
@@ -266,22 +279,25 @@ def write_alignment_topics(
     out_aligned: list,
     posimus: list,
     quick: bool,
+    ts_offset: int = 0,
 ) -> None:
     """Register the 5 computed alignment connections and write all their messages."""
 
     FRAME_ID  = 'global'
     POSE_TYPE = 'geometry_msgs/msg/PoseWithCovarianceStamped'
     PATH_TYPE = 'nav_msgs/msg/Path'
+    PoseWithCovStamped = typestore.types['geometry_msgs/msg/PoseWithCovarianceStamped']
+    Path_ = typestore.types['nav_msgs/msg/Path']
+    PoseStamped = typestore.types['geometry_msgs/msg/PoseStamped']
+    Header = typestore.types['std_msgs/msg/Header']
+    Time = typestore.types['builtin_interfaces/msg/Time']
+    Pose = typestore.types['geometry_msgs/msg/Pose']
+    PoseWithCov = typestore.types['geometry_msgs/msg/PoseWithCovariance']
+    Point = typestore.types['geometry_msgs/msg/Point']
+    Quat = typestore.types['geometry_msgs/msg/Quaternion']
 
     def make_pose_msg(stamp_ns, frame_id, pos, rot):
         q = rot.as_quat()
-        PoseWithCovStamped = typestore.types['geometry_msgs/msg/PoseWithCovarianceStamped']
-        Header      = typestore.types['std_msgs/msg/Header']
-        Time        = typestore.types['builtin_interfaces/msg/Time']
-        Pose        = typestore.types['geometry_msgs/msg/Pose']
-        PoseWithCov = typestore.types['geometry_msgs/msg/PoseWithCovariance']
-        Point       = typestore.types['geometry_msgs/msg/Point']
-        Quat        = typestore.types['geometry_msgs/msg/Quaternion']
         sec  = int(stamp_ns // 10**9)
         nsec = int(stamp_ns %  10**9)
         return PoseWithCovStamped(
@@ -297,13 +313,6 @@ def write_alignment_topics(
         )
 
     def make_path_msg(stamp_ns, frame_id, poses_so_far):
-        Path_       = typestore.types['nav_msgs/msg/Path']
-        PoseStamped = typestore.types['geometry_msgs/msg/PoseStamped']
-        Header      = typestore.types['std_msgs/msg/Header']
-        Time        = typestore.types['builtin_interfaces/msg/Time']
-        Pose        = typestore.types['geometry_msgs/msg/Pose']
-        Point       = typestore.types['geometry_msgs/msg/Point']
-        Quat        = typestore.types['geometry_msgs/msg/Quaternion']
         sec  = int(stamp_ns // 10**9)
         nsec = int(stamp_ns %  10**9)
         pose_list = []
@@ -334,13 +343,13 @@ def write_alignment_topics(
         if out_poses:
             path_poses = [(stamp_ns, pos, rot) for _, stamp_ns, pos, rot in out_poses]
             first_ts, first_stamp_ns = out_poses[0][0], out_poses[0][1]
-            writer.write(conn_path, first_ts, typestore.serialize_cdr(
+            writer.write(conn_path, first_ts + ts_offset, typestore.serialize_cdr(
                 make_path_msg(first_stamp_ns, FRAME_ID, path_poses), PATH_TYPE))
 
         if out_aligned:
             path_poses_al = [(stamp_ns, pos, rot) for _, stamp_ns, pos, rot in out_aligned]
             first_ts_al, first_stamp_ns_al = out_aligned[0][0], out_aligned[0][1]
-            writer.write(conn_path_al, first_ts_al, typestore.serialize_cdr(
+            writer.write(conn_path_al, first_ts_al + ts_offset, typestore.serialize_cdr(
                 make_path_msg(first_stamp_ns_al, FRAME_ID, path_poses_al), PATH_TYPE))
 
         if posimus:
@@ -351,7 +360,7 @@ def write_alignment_topics(
                                           pm.pose.pose.orientation.z, pm.pose.pose.orientation.w])
                 stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
                 vio_path_poses.append((stamp_ns, pos, rot))
-            writer.write(conn_vio_path, posimus[0][0], typestore.serialize_cdr(
+            writer.write(conn_vio_path, posimus[0][0] + ts_offset, typestore.serialize_cdr(
                 make_path_msg(vio_path_poses[0][0], FRAME_ID, vio_path_poses), PATH_TYPE))
 
     else:
@@ -359,18 +368,18 @@ def write_alignment_topics(
         for k, (fix_ts, stamp_ns, pos, rot) in enumerate(out_poses, 1):
             q = rot.as_quat()
             rtk_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
-            writer.write(conn_pose, fix_ts, typestore.serialize_cdr(
+            writer.write(conn_pose, fix_ts + ts_offset, typestore.serialize_cdr(
                 make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
-            writer.write(conn_path, fix_ts,
+            writer.write(conn_path, fix_ts + ts_offset,
                          _path_header_cdr(stamp_ns, k) + bytes(rtk_buf))
 
         al_buf = bytearray()
         for k, (fix_ts, stamp_ns, pos, rot) in enumerate(out_aligned, 1):
             q = rot.as_quat()
             al_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
-            writer.write(conn_pose_al, fix_ts, typestore.serialize_cdr(
+            writer.write(conn_pose_al, fix_ts + ts_offset, typestore.serialize_cdr(
                 make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
-            writer.write(conn_path_al, fix_ts,
+            writer.write(conn_path_al, fix_ts + ts_offset,
                          _path_header_cdr(stamp_ns, k) + bytes(al_buf))
 
         pose_buf = bytearray()
@@ -380,7 +389,7 @@ def write_alignment_topics(
             q   = (pm.pose.pose.orientation.x, pm.pose.pose.orientation.y,
                    pm.pose.pose.orientation.z, pm.pose.pose.orientation.w)
             pose_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
-            writer.write(conn_vio_path, vio_ts,
+            writer.write(conn_vio_path, vio_ts + ts_offset,
                          _path_header_cdr(stamp_ns, k) + bytes(pose_buf))
 
 
@@ -388,7 +397,7 @@ def write_alignment_topics(
 # convert: write computed topics + passthrough of input bag topics
 # ---------------------------------------------------------------------------
 def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: bool = False) -> None:
-    out_poses, out_aligned, posimus, typestore, reader_path = \
+    out_poses, out_aligned, posimus, typestore, reader_path, _, _ = \
         compute_alignment(input_bag, vio_topic, stores_enum)
 
     out_dir = Path(output_bag)

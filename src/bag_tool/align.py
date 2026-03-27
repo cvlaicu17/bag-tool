@@ -27,7 +27,7 @@ def run(
     - remaining topics from input_bag not already in dest_bag (raw passthrough)
     No intermediate bag is written.
     """
-    out_poses, out_aligned, posimus, typestore, input_reader_path = \
+    out_poses, out_aligned, posimus, typestore, input_reader_path, input_start, input_end = \
         compute_alignment(input_bag, vio_topic, stores_enum)
 
     dest_path = Path(dest_bag)
@@ -44,20 +44,18 @@ def run(
         dest_topics = {c.topic for c in dest_conns}
 
         # Detect timestamp offset: if dest_bag and input_bag timestamps don't overlap,
-        # shift dest_bag MCAP timestamps so both datasets appear at the same time in Foxglove.
-        # Common case: DJI raw bags use boot-clock (seconds from boot), VIO bags use Unix wall time.
+        # shift input_bag topics to dest_bag's clock so the output aligns with the original recording.
+        # Common case: VIO bags use Unix wall time; DJI raw bags use boot-clock (seconds from boot).
         ts_offset = 0
-        with Reader(input_reader_path) as _ir:
-            dest_end   = dest_reader.start_time + dest_reader.duration
-            input_start = _ir.start_time
-            input_end   = _ir.start_time + _ir.duration
+        dest_end = dest_reader.start_time + dest_reader.duration
         if dest_end < input_start or dest_reader.start_time > input_end:
-            ts_offset = input_start - dest_reader.start_time
-            print(f'Timestamp offset: {ts_offset:+d} ns applied to dest bag topics '
-                  f'(dest clock and input clock do not overlap)')
+            ts_offset = dest_reader.start_time - input_start
+            print(f'Timestamp offset: {ts_offset:+d} ns applied to input bag topics '
+                  f'(input clock shifted to dest bag clock)')
 
         with Writer(out_path, version=9, storage_plugin=StoragePlugin.MCAP) as writer:
-            write_alignment_topics(writer, typestore, out_poses, out_aligned, posimus, quick)
+            write_alignment_topics(writer, typestore, out_poses, out_aligned, posimus, quick,
+                                   ts_offset=ts_offset)
 
             # Passthrough: all dest_bag topics (skip any that clash with computed)
             dest_conn_map: dict[int, object] = {
@@ -65,9 +63,10 @@ def run(
                 for conn in dest_conns
                 if conn.topic not in COMPUTED_TOPICS
             }
-            for conn, ts, rawdata in dest_reader.messages():
-                if conn.id in dest_conn_map:
-                    writer.write(dest_conn_map[conn.id], ts + ts_offset, rawdata)
+            if dest_conn_map:
+                passthrough_dest = [c for c in dest_conns if c.id in dest_conn_map]
+                for conn, ts, rawdata in dest_reader.messages(connections=passthrough_dest):
+                    writer.write(dest_conn_map[conn.id], ts, rawdata)
 
             # Passthrough: remaining input_bag topics not already registered
             already_registered = COMPUTED_TOPICS | dest_topics
@@ -79,6 +78,6 @@ def run(
                 if input_conn_map:
                     passthrough = [c for c in input_reader.connections if c.id in input_conn_map]
                     for c, ts, rawdata in input_reader.messages(connections=passthrough):
-                        writer.write(input_conn_map[c.id], ts, rawdata)
+                        writer.write(input_conn_map[c.id], ts + ts_offset, rawdata)
 
     print(f'Output written to: {out_path}')
