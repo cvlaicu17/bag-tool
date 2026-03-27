@@ -80,10 +80,12 @@ def main() -> None:
     # ---- align subcommand ----
     align_parser = subparsers.add_parser(
         "align",
-        help="Compute RTK-VIO alignment and merge with dest bag topics in one pass.",
+        help="Compute RTK-VIO alignment and write aligned bag next to the input.",
     )
-    align_parser.add_argument("input_bag", help="Bag with RTK + VIO data (alignment source)")
-    align_parser.add_argument("dest_bag",  help="Bag whose topics are carried into the output")
+    align_parser.add_argument("input_bag", help="Bag with RTK + VIO data to align")
+    align_parser.add_argument("ref_bag", nargs="?", default=None,
+                              help="Optional reference bag used only for timestamp alignment "
+                                   "(e.g. the original DJI recording)")
     align_parser.add_argument(
         "-n", "--new-topic",
         action="store_true",
@@ -170,7 +172,7 @@ def main() -> None:
         print(f"VIO topic   : {vio_topic}")
         print()
 
-        run_align(args.input_bag, args.dest_bag, vio_topic, stores, quick=args.quick)
+        run_align(args.input_bag, vio_topic, stores, ref_bag=args.ref_bag, quick=args.quick)
 
     elif args.command == "add-topics":
         print()
