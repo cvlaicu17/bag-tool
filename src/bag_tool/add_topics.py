@@ -2,49 +2,47 @@
 
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
 from rosbags.rosbag2 import Reader, Writer
 from rosbags.rosbag2.writer import StoragePlugin
 
-_ROS2_PRIMITIVES = frozenset([
-    'bool', 'byte', 'char',
-    'float32', 'float64',
-    'int8', 'uint8', 'int16', 'uint16', 'int32', 'uint32', 'int64', 'uint64',
-    'string', 'wstring',
-])
+
+_QUAT_DEFAULTS = {
+    'float64 x': 'float64 x 0',
+    'float64 y': 'float64 y 0',
+    'float64 z': 'float64 z 0',
+    'float64 w': 'float64 w 1',
+}
 
 
 def _normalize_msgdef(msgdef: str) -> str:
-    """Strip default-value annotations so merged bags have consistent nested-type definitions.
+    """Ensure geometry_msgs/Quaternion fields carry standard defaults (x=0,y=0,z=0,w=1).
 
-    rosbags typestore emits IDL with @default(...) annotations; original ROS2 bags use
-    plain MSG fields with no defaults.  Foxglove parses both forms and reports a conflict
-    when the same nested type appears with different inline definitions across schemas.
+    Rosbags typestore-generated schemas omit field defaults; DJI and VIO bags include
+    them.  Adding them here keeps all schemas in a merged bag consistent and avoids
+    Foxglove cross-bag schema conflicts when opening alongside the original recording.
+    Fields that already carry a default are left unchanged.
     """
-    if '\nIDL: ' in msgdef[:200] or msgdef.lstrip().startswith('IDL: '):
-        # IDL format — remove @default(...) annotations (may be on their own line or inline)
-        return re.sub(r'\s*@default\s*\([^)]*\)', '', msgdef)
-
-    # ros2msg format — strip trailing default values from primitive field declarations.
-    # Fields with defaults look like:  "float64 w 1"  (type, name, value)
-    # Constants look like:             "float64 MY_K=3.14"  — leave those alone.
-    lines = []
-    for line in msgdef.splitlines():
+    lines = msgdef.splitlines()
+    result = []
+    in_quat = False
+    for line in lines:
         stripped = line.strip()
-        if not stripped or stripped.startswith('#'):
-            lines.append(line)
+        if 'MSG: geometry_msgs/Quaternion' in stripped:
+            in_quat = True
+            result.append(line)
             continue
-        field_part = stripped.split('#', 1)[0]
-        tokens = field_part.split()
-        if len(tokens) == 3 and '=' not in tokens[0] and tokens[0] in _ROS2_PRIMITIVES:
-            indent = len(line) - len(line.lstrip())
-            lines.append(' ' * indent + f'{tokens[0]} {tokens[1]}')
-        else:
-            lines.append(line)
-    return '\n'.join(lines)
+        if in_quat:
+            if stripped.startswith('MSG:') or stripped.startswith('====='):
+                in_quat = False
+            elif stripped in _QUAT_DEFAULTS:
+                indent = len(line) - len(line.lstrip())
+                result.append(' ' * indent + _QUAT_DEFAULTS[stripped])
+                continue
+        result.append(line)
+    return '\n'.join(result)
 
 
 def _reader_path(path: Path) -> Path:

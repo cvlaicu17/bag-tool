@@ -333,11 +333,21 @@ def write_alignment_topics(
             poses=pose_list,
         )
 
-    conn_pose    = None if quick else writer.add_connection('/ov_srvins/rtk/pose',         POSE_TYPE, typestore=typestore)
-    conn_path    = writer.add_connection('/ov_srvins/rtk/path',         PATH_TYPE, typestore=typestore)
-    conn_pose_al = None if quick else writer.add_connection('/ov_srvins/rtk/pose_aligned', POSE_TYPE, typestore=typestore)
-    conn_path_al = writer.add_connection('/ov_srvins/rtk/path_aligned', PATH_TYPE, typestore=typestore)
-    conn_vio_path = writer.add_connection('/ov_srvins/vio/path',        PATH_TYPE, typestore=typestore)
+    def _computed_conn(topic, msgtype):
+        msgdef, rihs01 = typestore.generate_msgdef(msgtype)
+        return writer.add_connection(
+            topic, msgtype,
+            msgdef=_normalize_msgdef(msgdef),
+            rihs01=rihs01,
+            serialization_format='cdr',
+            offered_qos_profiles='',
+        )
+
+    conn_pose    = None if quick else _computed_conn('/ov_srvins/rtk/pose',         POSE_TYPE)
+    conn_path    = _computed_conn('/ov_srvins/rtk/path',         PATH_TYPE)
+    conn_pose_al = None if quick else _computed_conn('/ov_srvins/rtk/pose_aligned', POSE_TYPE)
+    conn_path_al = _computed_conn('/ov_srvins/rtk/path_aligned', PATH_TYPE)
+    conn_vio_path = _computed_conn('/ov_srvins/vio/path',        PATH_TYPE)
 
     if quick:
         if out_poses:
