@@ -71,3 +71,14 @@ def run(
                     writer.write(conn_map[c.id], ts + ts_offset, rawdata)
 
     print(f'Output written to: {out_path}')
+
+    # Hard-link the .mcap file next to ref_bag for easy access.
+    if ref_bag is not None:
+        mcap_file = out_path / f'{out_path.name}.mcap'
+        ref_path = Path(ref_bag)
+        link_path = ref_path.parent / mcap_file.name
+        if link_path.exists():
+            print(f'Hard link already exists: {link_path} — skipping')
+        else:
+            link_path.hardlink_to(mcap_file)
+            print(f'Hard link created: {link_path}')
