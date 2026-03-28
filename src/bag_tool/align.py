@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
 
@@ -37,8 +38,8 @@ def run(
     input_path = Path(input_bag)
     out_path   = input_path.parent / (input_path.stem + '_aligned')
     if out_path.exists():
-        print(f'ERROR: output path {out_path} already exists — remove it first', file=sys.stderr)
-        sys.exit(1)
+        shutil.rmtree(out_path)
+        print(f'Removed existing output: {out_path}')
 
     # Optional timestamp alignment: shift all output to ref_bag's clock frame.
     # Also collect ref_bag topics so we don't duplicate them in the passthrough.
@@ -78,7 +79,6 @@ def run(
         ref_path = Path(ref_bag)
         link_path = ref_path.parent / mcap_file.name
         if link_path.exists():
-            print(f'Hard link already exists: {link_path} — skipping')
-        else:
-            link_path.hardlink_to(mcap_file)
-            print(f'Hard link created: {link_path}')
+            link_path.unlink()
+        link_path.hardlink_to(mcap_file)
+        print(f'Hard link created: {link_path}')
