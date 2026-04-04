@@ -47,6 +47,7 @@ def run(input_bag: str, output_bag: str) -> None:
         if total_count % 50000 == 0:
             print(f'  processed {total_count} messages ({range_count} range)...')
 
+    del writer  # flush and close before reading back
     print(f'Done: {total_count} total, {range_count} range messages fixed')
 
     # Verify

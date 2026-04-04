@@ -96,6 +96,11 @@ def main() -> None:
         action="store_true",
         help="Only write path topics (skip per-message pose topics).",
     )
+    align_parser.add_argument(
+        "--rte-window",
+        type=float, default=2.0, metavar="SECONDS",
+        help="Window size in seconds for relative trajectory error (default: 2.0).",
+    )
 
     # ---- add-topics subcommand ----
     addtopics_parser = subparsers.add_parser(
@@ -172,7 +177,8 @@ def main() -> None:
         print(f"VIO topic   : {vio_topic}")
         print()
 
-        run_align(args.input_bag, vio_topic, stores, ref_bag=args.ref_bag, quick=args.quick)
+        run_align(args.input_bag, vio_topic, stores, ref_bag=args.ref_bag, quick=args.quick,
+                  rte_window=args.rte_window)
 
     elif args.command == "add-topics":
         print()

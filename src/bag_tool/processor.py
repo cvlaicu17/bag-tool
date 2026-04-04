@@ -13,6 +13,7 @@ Writes a new bag with:
   /ov_srvins/rtk/path_aligned  nav_msgs/Path
 """
 
+import bisect
 import math
 import struct
 import sys
@@ -38,8 +39,6 @@ from bag_tool.add_topics import _normalize_msgdef
 _ENCAP        = b'\x00\x01\x00\x00'
 _PATH_FID     = b'\x07\x00\x00\x00global\x00\x00'            # len(4) + "global\0"(7) + pad(1) = 12
 _POSE_FID_PAD = b'\x07\x00\x00\x00global\x00\x00\x00\x00\x00\x00'  # len(4) + "global\0"(7) + pad(5) = 16
-_ALIGN_POS_ROT = Rotation.from_euler('z', -math.pi / 2)
-
 
 def _path_header_cdr(stamp_ns: int, n_poses: int) -> bytes:
     sec, nsec = divmod(stamp_ns, 10 ** 9)
@@ -98,6 +97,8 @@ COMPUTED_TOPICS = frozenset({
     '/ov_srvins/rtk/pose_aligned',
     '/ov_srvins/rtk/path_aligned',
     '/ov_srvins/vio/path',
+    '/ov_srvins/ate',
+    '/ov_srvins/rte',
 })
 
 
@@ -184,6 +185,7 @@ def compute_alignment(
     pose_offset   = None
     rtk_init_rot  = None
     align_rot     = None
+    align_rot_pos = None  # position uses an additional -90° Z correction (ENU→VIO frame)
     align_trans   = None
     prev_q_arr    = None
     prev_q_al_arr = None
@@ -240,8 +242,9 @@ def compute_alignment(
         if rtk_init_rot is None:
             rtk_init_rot = rot
             if vio_init_rot is not None:
-                align_rot   = vio_init_rot * rtk_init_rot.inv()
-                align_trans = vio_init_pos
+                align_rot     = vio_init_rot * rtk_init_rot.inv()
+                align_rot_pos = Rotation.from_euler('z', -math.pi / 2) * align_rot
+                align_trans   = vio_init_pos
                 print('RTK↔VIO alignment computed')
 
         hdr_sec  = fix_msg.header.stamp.sec
@@ -251,18 +254,11 @@ def compute_alignment(
         out_poses.append((fix_ts, stamp_ns, enu, rot))
 
         if align_rot is not None:
-            p_al = align_rot.apply(enu) + align_trans
+            p_al = align_rot_pos.apply(enu) + align_trans
             q_al_arr = (align_rot * rot).as_quat()
             if prev_q_al_arr is not None and np.dot(q_al_arr, prev_q_al_arr) < 0:
                 q_al_arr = -q_al_arr
             prev_q_al_arr = q_al_arr
-
-            # TODO: TEMPORARY - extra 90° position rotation for axis investigation.
-            # Orientation is left as computed by alignment; only the position vector
-            # is rotated. Do NOT use for production — will be removed once the axis
-            # confusion is understood and fixed properly.
-            p_al = _ALIGN_POS_ROT.apply(p_al)
-
             out_aligned.append((fix_ts, stamp_ns, p_al, Rotation.from_quat(q_al_arr)))
 
     print(f'Emitted {len(out_poses)} RTK poses, {len(out_aligned)} aligned poses')
@@ -280,8 +276,9 @@ def write_alignment_topics(
     posimus: list,
     quick: bool,
     ts_offset: int = 0,
+    rte_window_ns: int = 2_000_000_000,
 ) -> None:
-    """Register the 5 computed alignment connections and write all their messages."""
+    """Register computed alignment connections and write all their messages."""
 
     FRAME_ID  = 'global'
     POSE_TYPE = 'geometry_msgs/msg/PoseWithCovarianceStamped'
@@ -348,6 +345,8 @@ def write_alignment_topics(
     conn_pose_al = None if quick else _computed_conn('/ov_srvins/rtk/pose_aligned', POSE_TYPE)
     conn_path_al = _computed_conn('/ov_srvins/rtk/path_aligned', PATH_TYPE)
     conn_vio_path = _computed_conn('/ov_srvins/vio/path',        PATH_TYPE)
+    conn_ate      = _computed_conn('/ov_srvins/ate', 'std_msgs/msg/Float64')
+    conn_rte      = _computed_conn('/ov_srvins/rte', 'std_msgs/msg/Float64')
 
     if quick:
         if out_poses:
@@ -401,6 +400,45 @@ def write_alignment_topics(
             pose_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
             writer.write(conn_vio_path, vio_ts + ts_offset,
                          _path_header_cdr(stamp_ns, k) + bytes(pose_buf))
+
+    # ATE + RTE: one Float64 per VIO frame
+    if out_aligned and posimus:
+        al_stamps    = [stamp_ns for _, stamp_ns, _, _ in out_aligned]
+        al_positions = [pos_al   for _, _, pos_al, _ in out_aligned]
+        n_al = len(al_stamps)
+
+        def _nearest_al(vio_stamp_ns):
+            idx = bisect.bisect_left(al_stamps, vio_stamp_ns)
+            if idx == 0:
+                return 0
+            if idx >= n_al:
+                return n_al - 1
+            return idx if (al_stamps[idx] - vio_stamp_ns) <= (vio_stamp_ns - al_stamps[idx - 1]) else idx - 1
+
+        # First pass: compute ATE for every VIO frame and record (bag_ts, header_stamp_ns, ate).
+        ate_records: list[tuple[int, int, float]] = []
+        for vio_ts, pm in posimus:
+            vio_pos      = np.array([pm.pose.pose.position.x,
+                                     pm.pose.pose.position.y,
+                                     pm.pose.pose.position.z])
+            vio_stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
+            ate = float(np.linalg.norm(vio_pos - al_positions[_nearest_al(vio_stamp_ns)]))
+            ate_records.append((vio_ts, vio_stamp_ns, ate))
+            writer.write(conn_ate, vio_ts + ts_offset, _ENCAP + struct.pack('<d', ate))
+
+        # Second pass: RTE = ate(t) - ate(t - rte_window_ns), using header stamps for the window.
+        ate_header_stamps = [r[1] for r in ate_records]
+        n_ate = len(ate_records)
+        for i, (vio_ts, vio_stamp_ns, ate) in enumerate(ate_records):
+            past_stamp = vio_stamp_ns - rte_window_ns
+            j = bisect.bisect_left(ate_header_stamps, past_stamp)
+            if j >= n_ate:
+                j = n_ate - 1
+            # Pick whichever neighbour is closer to past_stamp.
+            if j > 0 and (ate_header_stamps[j] - past_stamp) > (past_stamp - ate_header_stamps[j - 1]):
+                j -= 1
+            rte = ate - ate_records[j][2]
+            writer.write(conn_rte, vio_ts + ts_offset, _ENCAP + struct.pack('<d', rte))
 
 
 # ---------------------------------------------------------------------------

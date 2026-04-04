@@ -19,6 +19,7 @@ def run(
     stores_enum,
     ref_bag: str | None = None,
     quick: bool = False,
+    rte_window: float = 2.0,
 ) -> None:
     """Compute RTK-VIO alignment from input_bag and write a new aligned bag next to it.
 
@@ -58,7 +59,8 @@ def run(
     with Reader(input_reader_path) as input_reader:
         with Writer(out_path, version=9, storage_plugin=StoragePlugin.MCAP) as writer:
             write_alignment_topics(writer, typestore, out_poses, out_aligned, posimus, quick,
-                                   ts_offset=ts_offset)
+                                   ts_offset=ts_offset,
+                                   rte_window_ns=int(rte_window * 1e9))
 
             skip = COMPUTED_TOPICS | ref_topics
             conn_map: dict[int, object] = {
