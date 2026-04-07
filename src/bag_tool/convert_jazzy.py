@@ -6,15 +6,19 @@ This appends variance=0.0 (4 bytes) to each Range message.
 
 from __future__ import annotations
 
+import os
 import struct
+import subprocess
 import sys
 
-import rosbag2_py
-from rclpy.serialization import deserialize_message, serialize_message
-from sensor_msgs.msg import Range
+_ROS_SETUP = '/opt/ros/jazzy/setup.bash'
 
 
-def run(input_bag: str, output_bag: str) -> None:
+def _run_inner(input_bag: str, output_bag: str) -> None:
+    import rosbag2_py
+    from rclpy.serialization import deserialize_message, serialize_message
+    from sensor_msgs.msg import Range
+
     reader = rosbag2_py.SequentialReader()
     reader.open(
         rosbag2_py.StorageOptions(uri=input_bag, storage_id='mcap'),
@@ -67,3 +71,17 @@ def run(input_bag: str, output_bag: str) -> None:
             if verified >= 3:
                 break
     print(f'Verification: {verified} Range messages deserialized OK')
+
+
+def run(input_bag: str, output_bag: str) -> None:
+    try:
+        import rosbag2_py  # noqa: F401
+    except ImportError:
+        if not os.path.exists(_ROS_SETUP):
+            print(f'ERROR: ROS Jazzy not found at {_ROS_SETUP}', file=sys.stderr)
+            sys.exit(1)
+        cmd = f'source {_ROS_SETUP} && /usr/bin/python3.12 -c "from bag_tool.convert_jazzy import _run_inner; _run_inner({input_bag!r}, {output_bag!r})"'
+        result = subprocess.run(['bash', '-c', cmd])
+        sys.exit(result.returncode)
+
+    _run_inner(input_bag, output_bag)
