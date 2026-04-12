@@ -155,12 +155,11 @@ def compute_alignment(
     posimus.sort(key=lambda x: x[0])
 
     if not fixes:
-        print('ERROR: no /m300/rtk/fix messages found in bag', file=sys.stderr)
-        sys.exit(1)
+        print('WARNING: no /m300/rtk/fix messages found — skipping RTK, emitting VIO path only')
 
-    if not yaws:
-        print('ERROR: no /m300/rtk/yaw messages found in bag', file=sys.stderr)
-        sys.exit(1)
+    if not yaws and fixes:
+        print('WARNING: no /m300/rtk/yaw messages found — skipping RTK')
+        fixes = []
 
     if not posimus:
         print(f'WARNING: no {vio_topic} messages — aligned topics will be empty')
@@ -243,7 +242,11 @@ def compute_alignment(
             rtk_init_rot = rot
             if vio_init_rot is not None:
                 align_rot     = vio_init_rot * rtk_init_rot.inv()
-                align_rot_pos = Rotation.from_euler('z', -math.pi / 2) * align_rot
+                # Strip pitch/roll from the position rotation: RTK altitude is geodetic
+                # (Z = up) and applying pitch/roll would tilt the whole trajectory.
+                # Use only the yaw component of align_rot for position.
+                align_yaw_rad = align_rot.as_euler('zyx')[0]
+                align_rot_pos = Rotation.from_euler('z', -math.pi / 2 + align_yaw_rad)
                 align_trans   = vio_init_pos
                 print('RTK↔VIO alignment computed')
 
