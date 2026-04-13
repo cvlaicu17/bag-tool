@@ -423,7 +423,8 @@ def write_alignment_topics(
             writer.write(conn_jump_penalty, first_ts + ts_offset, _ENCAP + struct.pack('<d', jump_penalty))
             print(f'RMS RTE      : {rms_rte:.4f} m')
             print(f'Jump penalty : {jump_penalty:.4f} m  (threshold={JUMP_THRESHOLD}m)')
-        return
+            return {'rms_rte': rms_rte, 'jump_penalty': jump_penalty}
+        return {}
 
     conn_pose    = None if quick else _computed_conn('/ov_srvins/rtk/pose',         POSE_TYPE)
     conn_path    = _computed_conn('/ov_srvins/rtk/path',         PATH_TYPE)

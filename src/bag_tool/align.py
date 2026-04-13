@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -59,10 +60,10 @@ def run(
                   f'(input clock shifted to ref bag clock)')
     with Reader(input_reader_path) as input_reader:
         with Writer(out_path, version=9, storage_plugin=StoragePlugin.MCAP) as writer:
-            write_alignment_topics(writer, typestore, out_poses, out_aligned, posimus, quick,
-                                   ts_offset=ts_offset,
-                                   rte_window_ns=int(rte_window * 1e9),
-                                   eval_mode=eval_mode)
+            metrics = write_alignment_topics(writer, typestore, out_poses, out_aligned, posimus, quick,
+                                             ts_offset=ts_offset,
+                                             rte_window_ns=int(rte_window * 1e9),
+                                             eval_mode=eval_mode)
 
             if not eval_mode:
                 skip = COMPUTED_TOPICS | ref_topics
@@ -87,3 +88,8 @@ def run(
             link_path.unlink()
         link_path.hardlink_to(mcap_file)
         print(f'Hard link created: {link_path}')
+
+        if eval_mode and metrics:
+            json_path = link_path.with_suffix('.json')
+            json_path.write_text(json.dumps(metrics, indent=2))
+            print(f'Eval metrics written: {json_path}')
