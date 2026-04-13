@@ -60,6 +60,11 @@ def main() -> None:
         action="store_true",
         help="Only write path topics (skip per-message pose topics).",
     )
+    convert_parser.add_argument(
+        "--eval",
+        action="store_true",
+        help="Write only RTK aligned poses and srvins poses (no paths, no ATE/RTE).",
+    )
 
     # ---- convert-to-jazzy subcommand ----
     jazzy_parser = subparsers.add_parser(
@@ -97,9 +102,14 @@ def main() -> None:
         help="Only write path topics (skip per-message pose topics).",
     )
     align_parser.add_argument(
+        "--eval",
+        action="store_true",
+        help="Write only RTK aligned poses and srvins poses (no paths, no ATE/RTE).",
+    )
+    align_parser.add_argument(
         "--rte-window",
-        type=float, default=2.0, metavar="SECONDS",
-        help="Window size in seconds for relative trajectory error (default: 2.0).",
+        type=float, default=1.0, metavar="SECONDS",
+        help="Window size in seconds for relative trajectory error (default: 1.0).",
     )
 
     # ---- add-topics subcommand ----
@@ -150,7 +160,8 @@ def main() -> None:
 
         input_path = Path(args.input_bag)
         output_bag = args.output_bag or str(input_path.parent / (input_path.name + '_aligned'))
-        run_convert(args.input_bag, output_bag, vio_topic, stores, quick=args.quick)
+        run_convert(args.input_bag, output_bag, vio_topic, stores, quick=args.quick,
+                    eval_mode=args.eval)
 
     elif args.command == "convert-to-jazzy":
         print()
@@ -178,7 +189,7 @@ def main() -> None:
         print()
 
         run_align(args.input_bag, vio_topic, stores, ref_bag=args.ref_bag, quick=args.quick,
-                  rte_window=args.rte_window)
+                  rte_window=args.rte_window, eval_mode=args.eval)
 
     elif args.command == "add-topics":
         print()

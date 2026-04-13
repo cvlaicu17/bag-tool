@@ -19,7 +19,8 @@ def run(
     stores_enum,
     ref_bag: str | None = None,
     quick: bool = False,
-    rte_window: float = 2.0,
+    rte_window: float = 1.0,
+    eval_mode: bool = False,
 ) -> None:
     """Compute RTK-VIO alignment from input_bag and write a new aligned bag next to it.
 
@@ -60,18 +61,20 @@ def run(
         with Writer(out_path, version=9, storage_plugin=StoragePlugin.MCAP) as writer:
             write_alignment_topics(writer, typestore, out_poses, out_aligned, posimus, quick,
                                    ts_offset=ts_offset,
-                                   rte_window_ns=int(rte_window * 1e9))
+                                   rte_window_ns=int(rte_window * 1e9),
+                                   eval_mode=eval_mode)
 
-            skip = COMPUTED_TOPICS | ref_topics
-            conn_map: dict[int, object] = {
-                c.id: _add_conn(writer, c)
-                for c in input_reader.connections
-                if c.topic not in skip
-            }
-            if conn_map:
-                passthrough = [c for c in input_reader.connections if c.id in conn_map]
-                for c, ts, rawdata in input_reader.messages(connections=passthrough):
-                    writer.write(conn_map[c.id], ts + ts_offset, rawdata)
+            if not eval_mode:
+                skip = COMPUTED_TOPICS | ref_topics
+                conn_map: dict[int, object] = {
+                    c.id: _add_conn(writer, c)
+                    for c in input_reader.connections
+                    if c.topic not in skip
+                }
+                if conn_map:
+                    passthrough = [c for c in input_reader.connections if c.id in conn_map]
+                    for c, ts, rawdata in input_reader.messages(connections=passthrough):
+                        writer.write(conn_map[c.id], ts + ts_offset, rawdata)
 
     print(f'Output written to: {out_path}')
 

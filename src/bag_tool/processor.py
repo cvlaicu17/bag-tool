@@ -96,9 +96,12 @@ COMPUTED_TOPICS = frozenset({
     '/ov_srvins/rtk/path',
     '/ov_srvins/rtk/pose_aligned',
     '/ov_srvins/rtk/path_aligned',
+    '/ov_srvins/vio/pose',
     '/ov_srvins/vio/path',
     '/ov_srvins/ate',
     '/ov_srvins/rte',
+    '/ov_srvins/eval_rms_rte',
+    '/ov_srvins/eval_jump_penalty',
 })
 
 
@@ -279,7 +282,8 @@ def write_alignment_topics(
     posimus: list,
     quick: bool,
     ts_offset: int = 0,
-    rte_window_ns: int = 2_000_000_000,
+    rte_window_ns: int = 1_000_000_000,
+    eval_mode: bool = False,
 ) -> None:
     """Register computed alignment connections and write all their messages."""
 
@@ -342,6 +346,66 @@ def write_alignment_topics(
             serialization_format='cdr',
             offered_qos_profiles='',
         )
+
+    if eval_mode:
+        conn_pose_al   = _computed_conn('/ov_srvins/rtk/pose_aligned', POSE_TYPE)
+        conn_vio_pose  = _computed_conn('/ov_srvins/vio/pose',          POSE_TYPE)
+        conn_rte          = _computed_conn('/ov_srvins/rte',              'std_msgs/msg/Float64')
+        conn_rms_rte      = _computed_conn('/ov_srvins/eval_rms_rte',   'std_msgs/msg/Float64')
+        conn_jump_penalty = _computed_conn('/ov_srvins/eval_jump_penalty', 'std_msgs/msg/Float64')
+        for fix_ts, stamp_ns, pos, rot in out_aligned:
+            writer.write(conn_pose_al, fix_ts + ts_offset, typestore.serialize_cdr(
+                make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
+        for vio_ts, pm in posimus:
+            stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
+            pos = np.array([pm.pose.pose.position.x, pm.pose.pose.position.y, pm.pose.pose.position.z])
+            rot = Rotation.from_quat([pm.pose.pose.orientation.x, pm.pose.pose.orientation.y,
+                                      pm.pose.pose.orientation.z, pm.pose.pose.orientation.w])
+            writer.write(conn_vio_pose, vio_ts + ts_offset, typestore.serialize_cdr(
+                make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
+        if out_aligned and posimus:
+            al_stamps    = [stamp_ns for _, stamp_ns, _, _ in out_aligned]
+            al_positions = [pos_al   for _, _, pos_al, _ in out_aligned]
+            n_al = len(al_stamps)
+            def _nearest_al_eval(vio_stamp_ns):
+                idx = bisect.bisect_left(al_stamps, vio_stamp_ns)
+                if idx == 0:    return 0
+                if idx >= n_al: return n_al - 1
+                return idx if (al_stamps[idx] - vio_stamp_ns) <= (vio_stamp_ns - al_stamps[idx - 1]) else idx - 1
+            ate_records: list[tuple[int, int, float]] = []
+            for vio_ts, pm in posimus:
+                vio_pos      = np.array([pm.pose.pose.position.x,
+                                         pm.pose.pose.position.y,
+                                         pm.pose.pose.position.z])
+                vio_stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
+                ate = float(np.linalg.norm(vio_pos - al_positions[_nearest_al_eval(vio_stamp_ns)]))
+                ate_records.append((vio_ts, vio_stamp_ns, ate))
+            ate_header_stamps = [r[1] for r in ate_records]
+            n_ate = len(ate_records)
+            rte_values: list[float] = []
+            for vio_ts, vio_stamp_ns, ate in ate_records:
+                past_stamp = vio_stamp_ns - rte_window_ns
+                j = bisect.bisect_left(ate_header_stamps, past_stamp)
+                if j >= n_ate: j = n_ate - 1
+                if j > 0 and (ate_header_stamps[j] - past_stamp) > (past_stamp - ate_header_stamps[j - 1]):
+                    j -= 1
+                rte = ate - ate_records[j][2]
+                rte_values.append(rte)
+                writer.write(conn_rte, vio_ts + ts_offset, _ENCAP + struct.pack('<d', rte))
+            JUMP_THRESHOLD = 1.0  # metres
+            rte_arr = np.array(rte_values)
+            rms_rte = float(np.sqrt(np.mean(rte_arr ** 2)))
+            if len(rte_arr) > 1:
+                excess       = np.maximum(0.0, np.abs(np.diff(rte_arr)) - JUMP_THRESHOLD)
+                jump_penalty = float(np.sqrt(np.sum(excess ** 2)))
+            else:
+                jump_penalty = 0.0
+            first_ts = ate_records[0][0]
+            writer.write(conn_rms_rte,      first_ts + ts_offset, _ENCAP + struct.pack('<d', rms_rte))
+            writer.write(conn_jump_penalty, first_ts + ts_offset, _ENCAP + struct.pack('<d', jump_penalty))
+            print(f'RMS RTE      : {rms_rte:.4f} m')
+            print(f'Jump penalty : {jump_penalty:.4f} m  (threshold={JUMP_THRESHOLD}m)')
+        return
 
     conn_pose    = None if quick else _computed_conn('/ov_srvins/rtk/pose',         POSE_TYPE)
     conn_path    = _computed_conn('/ov_srvins/rtk/path',         PATH_TYPE)
@@ -447,7 +511,8 @@ def write_alignment_topics(
 # ---------------------------------------------------------------------------
 # convert: write computed topics + passthrough of input bag topics
 # ---------------------------------------------------------------------------
-def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: bool = False) -> None:
+def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: bool = False,
+        eval_mode: bool = False) -> None:
     out_poses, out_aligned, posimus, typestore, reader_path, _, _ = \
         compute_alignment(input_bag, vio_topic, stores_enum)
 
@@ -457,7 +522,12 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
         sys.exit(1)
 
     with Writer(out_dir, version=9, storage_plugin=StoragePlugin.MCAP) as writer:
-        write_alignment_topics(writer, typestore, out_poses, out_aligned, posimus, quick)
+        write_alignment_topics(writer, typestore, out_poses, out_aligned, posimus, quick,
+                               eval_mode=eval_mode)
+
+        if eval_mode:
+            print(f'Output bag written to: {out_dir}')
+            return
 
         # Phase 4: copy all remaining source topics as raw bytes
         with Reader(reader_path) as src_reader:
