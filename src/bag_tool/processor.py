@@ -348,11 +348,29 @@ def write_alignment_topics(
         )
 
     if eval_mode:
-        conn_pose_al   = _computed_conn('/ov_srvins/rtk/pose_aligned', POSE_TYPE)
-        conn_vio_pose  = _computed_conn('/ov_srvins/vio/pose',          POSE_TYPE)
-        conn_rte          = _computed_conn('/ov_srvins/rte',              'std_msgs/msg/Float64')
-        conn_rms_rte      = _computed_conn('/ov_srvins/eval_rms_rte',   'std_msgs/msg/Float64')
-        conn_jump_penalty = _computed_conn('/ov_srvins/eval_jump_penalty', 'std_msgs/msg/Float64')
+        conn_pose_al      = _computed_conn('/ov_srvins/rtk/pose_aligned',   POSE_TYPE)
+        conn_vio_pose     = _computed_conn('/ov_srvins/vio/pose',            POSE_TYPE)
+        conn_rte          = _computed_conn('/ov_srvins/rte',                 'std_msgs/msg/Float64')
+        conn_rms_rte      = _computed_conn('/ov_srvins/eval_rms_rte',        'std_msgs/msg/Float64')
+        conn_jump_penalty = _computed_conn('/ov_srvins/eval_jump_penalty',   'std_msgs/msg/Float64')
+
+        # Landing detection: rightmost RTK fix at or below 0.5 m ENU Z (height above takeoff).
+        LANDING_ALT = 0.5  # metres
+        landing_stamp_ns = None
+        for _, stamp_ns, pos, _ in reversed(out_poses):
+            if pos[2] <= LANDING_ALT:
+                landing_stamp_ns = stamp_ns
+                break
+        if landing_stamp_ns is not None:
+            n_before = len(posimus)
+            posimus     = [(ts, pm) for ts, pm in posimus
+                           if pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec <= landing_stamp_ns]
+            out_aligned = [(ft, sn, p, r) for ft, sn, p, r in out_aligned if sn <= landing_stamp_ns]
+            n_dropped = n_before - len(posimus)
+            print(f'Landing detected (ENU Z ≤ {LANDING_ALT}m) — dropped {n_dropped} post-landing VIO frames')
+        else:
+            print('WARNING: no landing point detected — using all VIO data')
+
         for fix_ts, stamp_ns, pos, rot in out_aligned:
             writer.write(conn_pose_al, fix_ts + ts_offset, typestore.serialize_cdr(
                 make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
