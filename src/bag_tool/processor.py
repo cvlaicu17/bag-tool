@@ -482,8 +482,8 @@ def write_alignment_topics(
             writer.write(conn_vio_path, vio_ts + ts_offset,
                          _path_header_cdr(stamp_ns, k) + bytes(pose_buf))
 
-    # ATE + RTE: one Float64 per VIO frame
-    if out_aligned and posimus:
+    # ATE + RTE: one Float64 per VIO frame (skipped in quick mode)
+    if conn_ate is not None and out_aligned and posimus:
         al_stamps    = [stamp_ns for _, stamp_ns, _, _ in out_aligned]
         al_positions = [pos_al   for _, _, pos_al, _ in out_aligned]
         n_al = len(al_stamps)
