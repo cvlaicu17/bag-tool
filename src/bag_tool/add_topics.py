@@ -117,8 +117,9 @@ def run(source_bag: str, dest_bag: str, topics: list[str]) -> None:
                 for conn, ts, rawdata in dest_reader.messages():
                     writer.write(dest_conn_map[conn.id], ts, rawdata)
 
+                new_msg_count = 0
                 for conn, ts, rawdata in src_reader.messages(connections=src_topic_conns):
                     writer.write(src_conn_map[conn.id], ts, rawdata)
+                    new_msg_count += 1
 
-    new_msg_count = sum(c.msgcount for c in src_conn_map.values())
     print(f'Appended {new_msg_count} messages ({len(topics)} topics) → {out_path}')
