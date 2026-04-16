@@ -428,6 +428,7 @@ def write_alignment_topics(
 
     conn_pose     = _computed_conn('/ov_srvins/rtk/pose',         POSE_TYPE)
     conn_pose_al  = _computed_conn('/ov_srvins/rtk/pose_aligned', POSE_TYPE)
+    conn_vio_pose = _computed_conn('/ov_srvins/vio/pose',         POSE_TYPE)
     conn_path     = None if quick else _computed_conn('/ov_srvins/rtk/path',         PATH_TYPE)
     conn_path_al  = None if quick else _computed_conn('/ov_srvins/rtk/path_aligned', PATH_TYPE)
     conn_vio_path = None if quick else _computed_conn('/ov_srvins/vio/path',         PATH_TYPE)
@@ -440,6 +441,13 @@ def write_alignment_topics(
                 make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
         for fix_ts, stamp_ns, pos, rot in out_aligned:
             writer.write(conn_pose_al, fix_ts + ts_offset, typestore.serialize_cdr(
+                make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
+        for vio_ts, pm in posimus:
+            stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
+            pos = np.array([pm.pose.pose.position.x, pm.pose.pose.position.y, pm.pose.pose.position.z])
+            rot = Rotation.from_quat([pm.pose.pose.orientation.x, pm.pose.pose.orientation.y,
+                                      pm.pose.pose.orientation.z, pm.pose.pose.orientation.w])
+            writer.write(conn_vio_pose, vio_ts + ts_offset, typestore.serialize_cdr(
                 make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
 
     else:
@@ -468,6 +476,9 @@ def write_alignment_topics(
             q   = (pm.pose.pose.orientation.x, pm.pose.pose.orientation.y,
                    pm.pose.pose.orientation.z, pm.pose.pose.orientation.w)
             pose_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
+            rot = Rotation.from_quat(q)
+            writer.write(conn_vio_pose, vio_ts + ts_offset, typestore.serialize_cdr(
+                make_pose_msg(stamp_ns, FRAME_ID, np.array(pos), rot), POSE_TYPE))
             writer.write(conn_vio_path, vio_ts + ts_offset,
                          _path_header_cdr(stamp_ns, k) + bytes(pose_buf))
 
