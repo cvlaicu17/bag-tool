@@ -112,6 +112,7 @@ def compute_alignment(
     input_bag: str,
     vio_topic: str,
     stores_enum,
+    aruco_yaw_rad: float | None = None,
 ) -> tuple:
     """Load RTK/VIO data from input_bag and compute ENU + aligned poses.
 
@@ -123,6 +124,7 @@ def compute_alignment(
     typestore   : rosbags typestore (needed for Phase 3 serialisation)
     reader_path : Path that was opened (for Phase 4 passthrough in convert)
     input_start_ns/input_end_ns : bag time bounds (for align timestamp-offset detection)
+    aruco_yaw_rad : pre-computed ArUco north yaw (radians); if provided, skips RTK yaw method.
     """
     typestore = get_typestore(stores_enum)
 
@@ -244,14 +246,24 @@ def compute_alignment(
         if rtk_init_rot is None:
             rtk_init_rot = rot
             if vio_init_rot is not None:
-                align_rot     = vio_init_rot * rtk_init_rot.inv()
-                # Strip pitch/roll from the position rotation: RTK altitude is geodetic
-                # (Z = up) and applying pitch/roll would tilt the whole trajectory.
-                # Use only the yaw component of align_rot for position.
-                align_yaw_rad = align_rot.as_euler('zyx')[0]
-                align_rot_pos = Rotation.from_euler('z', -math.pi / 2 + align_yaw_rad)
-                align_trans   = vio_init_pos
-                print('RTK↔VIO alignment computed')
+                # Always compute RTK yaw (used as fallback and for diagnostics).
+                rtk_align_rot = vio_init_rot * rtk_init_rot.inv()
+                rtk_yaw_rad   = rtk_align_rot.as_euler('zyx')[0]
+
+                if aruco_yaw_rad is not None:
+                    diff_deg = math.degrees(aruco_yaw_rad - rtk_yaw_rad)
+                    print(f'RTK yaw  : {math.degrees(rtk_yaw_rad):+.2f}°')
+                    print(f'ArUco yaw: {math.degrees(aruco_yaw_rad):+.2f}°  (diff {diff_deg:+.2f}°)')
+                    align_rot     = Rotation.from_euler('z', aruco_yaw_rad)
+                    align_rot_pos = Rotation.from_euler('z', -math.pi / 2 + aruco_yaw_rad)
+                    align_trans   = vio_init_pos
+                    print('RTK↔VIO alignment computed (ArUco method)')
+                else:
+                    align_rot     = rtk_align_rot
+                    # Strip pitch/roll: use only yaw for position rotation.
+                    align_rot_pos = Rotation.from_euler('z', -math.pi / 2 + rtk_yaw_rad)
+                    align_trans   = vio_init_pos
+                    print('RTK↔VIO alignment computed (RTK yaw method)')
 
         hdr_sec  = fix_msg.header.stamp.sec
         hdr_nsec = fix_msg.header.stamp.nanosec
@@ -525,8 +537,21 @@ def write_alignment_topics(
 # ---------------------------------------------------------------------------
 def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: bool = False,
         eval_mode: bool = False) -> None:
+    from bag_tool.aruco_align import detect_aruco_north
+    # For convert, camera images are in the input bag itself.
+    _input_path = Path(input_bag)
+    _reader_path_conv = _input_path.parent if _input_path.is_file() else _input_path
+    _store = get_typestore(stores_enum)
+    _posimus = []
+    with Reader(_reader_path_conv) as _r:
+        _conns = [c for c in _r.connections if c.topic == vio_topic]
+        for _c, _bag_ts, _raw in _r.messages(connections=_conns):
+            _posimus.append((_bag_ts, _store.deserialize_cdr(_raw, _c.msgtype)))
+    _posimus.sort(key=lambda x: x[0])
+    aruco_yaw_rad = detect_aruco_north(_reader_path_conv, _posimus, _store)
+
     out_poses, out_aligned, posimus, typestore, reader_path, _, _ = \
-        compute_alignment(input_bag, vio_topic, stores_enum)
+        compute_alignment(input_bag, vio_topic, stores_enum, aruco_yaw_rad=aruco_yaw_rad)
 
     out_dir = Path(output_bag)
     if out_dir.exists():

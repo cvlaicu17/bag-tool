@@ -112,6 +112,11 @@ def main() -> None:
         type=float, default=1.0, metavar="SECONDS",
         help="Window size in seconds for relative trajectory error (default: 1.0).",
     )
+    align_parser.add_argument(
+        "--manual",
+        action="store_true",
+        help="Skip ArUco detection and use the RTK yaw method directly.",
+    )
 
     # ---- add-topics subcommand ----
     addtopics_parser = subparsers.add_parser(
@@ -227,7 +232,7 @@ def main() -> None:
         print()
 
         run_align(args.input_bag, vio_topic, stores, ref_bag=args.ref_bag, quick=args.quick,
-                  rte_window=args.rte_window, eval_mode=args.eval)
+                  rte_window=args.rte_window, eval_mode=args.eval, manual=args.manual)
 
     elif args.command == "add-topics":
         print()
