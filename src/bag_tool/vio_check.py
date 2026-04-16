@@ -476,25 +476,35 @@ def plot_results(topics_data: dict, sync_result: dict):
 def run(args) -> None:
     cam_topic = args.camera
     imu_topic = args.imu
+    rtk_topic = args.rtk
+
+    read_topics = [cam_topic, imu_topic]
+    if rtk_topic:
+        read_topics.append(rtk_topic)
 
     print(SEP)
     print(f"  VIO Bag Quality Report")
     print(f"  Bag    : {args.input_bag}")
-    print(f"  Topics : {cam_topic}  |  {imu_topic}")
+    rtk_label = f"  |  {rtk_topic}" if rtk_topic else ""
+    print(f"  Topics : {cam_topic}  |  {imu_topic}{rtk_label}")
     print(SEP)
 
     print("[INFO] Reading bag …")
-    topics_raw = read_timestamps(args.input_bag, [cam_topic, imu_topic])
+    topics_raw = read_timestamps(args.input_bag, read_topics)
 
     cam_log   = topics_raw[cam_topic]["log_times"]
     cam_stamp = topics_raw[cam_topic]["stamp_times"]
     imu_log   = topics_raw[imu_topic]["log_times"]
     imu_stamp = topics_raw[imu_topic]["stamp_times"]
+    rtk_log   = topics_raw[rtk_topic]["log_times"]  if rtk_topic else []
+    rtk_stamp = topics_raw[rtk_topic]["stamp_times"] if rtk_topic else []
 
     if not cam_log:
         print(fail(f"No messages found on camera topic '{cam_topic}'"))
     if not imu_log:
         print(fail(f"No messages found on IMU topic '{imu_topic}'"))
+    if rtk_topic and not rtk_log:
+        print(warn(f"No messages found on RTK topic '{rtk_topic}' — skipping RTK check"))
 
     print(SEP)
     results = {}
@@ -505,6 +515,10 @@ def run(args) -> None:
     if imu_log:
         r = analyze_topic(imu_topic, imu_log, imu_stamp, args.imu_hz, args.gap_mult)
         results[imu_topic] = r
+        print_topic_report(r)
+    if rtk_topic and rtk_log:
+        r = analyze_topic(rtk_topic, rtk_log, rtk_stamp, 20.0, args.gap_mult)
+        results[rtk_topic] = r
         print_topic_report(r)
 
     print(SEP)
