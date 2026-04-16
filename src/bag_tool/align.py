@@ -65,7 +65,7 @@ def run(
                                              rte_window_ns=int(rte_window * 1e9),
                                              eval_mode=eval_mode)
 
-            if not eval_mode:
+            if not eval_mode and not quick:
                 skip = COMPUTED_TOPICS | ref_topics
                 conn_map: dict[int, object] = {
                     c.id: _add_conn(writer, c)

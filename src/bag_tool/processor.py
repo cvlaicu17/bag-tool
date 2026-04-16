@@ -426,9 +426,9 @@ def write_alignment_topics(
             return {'rms_rte': rms_rte, 'jump_penalty': jump_penalty}
         return {}
 
-    conn_pose     = _computed_conn('/ov_srvins/rtk/pose',         POSE_TYPE)
     conn_pose_al  = _computed_conn('/ov_srvins/rtk/pose_aligned', POSE_TYPE)
     conn_vio_pose = _computed_conn('/ov_srvins/vio/pose',         POSE_TYPE)
+    conn_pose     = None if quick else _computed_conn('/ov_srvins/rtk/pose',         POSE_TYPE)
     conn_path     = None if quick else _computed_conn('/ov_srvins/rtk/path',         PATH_TYPE)
     conn_path_al  = None if quick else _computed_conn('/ov_srvins/rtk/path_aligned', PATH_TYPE)
     conn_vio_path = None if quick else _computed_conn('/ov_srvins/vio/path',         PATH_TYPE)
@@ -436,9 +436,6 @@ def write_alignment_topics(
     conn_rte      = None if quick else _computed_conn('/ov_srvins/rte', 'std_msgs/msg/Float64')
 
     if quick:
-        for fix_ts, stamp_ns, pos, rot in out_poses:
-            writer.write(conn_pose, fix_ts + ts_offset, typestore.serialize_cdr(
-                make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
         for fix_ts, stamp_ns, pos, rot in out_aligned:
             writer.write(conn_pose_al, fix_ts + ts_offset, typestore.serialize_cdr(
                 make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
@@ -449,6 +446,7 @@ def write_alignment_topics(
                                       pm.pose.pose.orientation.z, pm.pose.pose.orientation.w])
             writer.write(conn_vio_pose, vio_ts + ts_offset, typestore.serialize_cdr(
                 make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
+        return
 
     else:
         rtk_buf = bytearray()
@@ -539,7 +537,7 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
         write_alignment_topics(writer, typestore, out_poses, out_aligned, posimus, quick,
                                eval_mode=eval_mode)
 
-        if eval_mode:
+        if eval_mode or quick:
             print(f'Output bag written to: {out_dir}')
             return
 
