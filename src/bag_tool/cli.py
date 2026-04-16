@@ -117,9 +117,23 @@ def main() -> None:
     addtopics_parser = subparsers.add_parser(
         "add-topics",
         help="Append topics from a source bag into an existing dest bag (in-place).",
+        description=(
+            "Append topics from a source bag into an existing destination bag (modified in-place).\n"
+            "\n"
+            "Examples:\n"
+            "  # Copy all topics from source into dest:\n"
+            "  bag-tool add-topics source/ dest/\n"
+            "\n"
+            "  # Copy only two specific topics:\n"
+            "  bag-tool add-topics source/ dest/ /camera/image_mono /imu/data_raw\n"
+            "\n"
+            "  # Merge an aligned bag's pose topics into the original bag:\n"
+            "  bag-tool add-topics my_bag_aligned/ my_bag/ /ov_srvins/rtk/pose_aligned /ov_srvins/vio/pose\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     addtopics_parser.add_argument("source_bag", help="Source bag to read topics FROM")
-    addtopics_parser.add_argument("dest_bag",   help="Existing bag to append topics INTO")
+    addtopics_parser.add_argument("dest_bag",   help="Existing bag to append topics INTO (modified in-place)")
     addtopics_parser.add_argument("topics", nargs="*", help="Topic name(s) to copy (default: all topics in source bag)")
 
     # ---- trim subcommand ----
