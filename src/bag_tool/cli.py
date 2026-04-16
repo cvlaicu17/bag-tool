@@ -13,6 +13,7 @@ from bag_tool.altimeter import run as run_compare_altimeter
 from bag_tool.convert_jazzy import run as run_convert_jazzy
 from bag_tool.add_topics import run as run_add_topics
 from bag_tool.align import run as run_align
+from bag_tool.vio_check import run as run_vio_check
 
 
 _DEFAULT_VIO_TOPIC = "/ov_srvins/poseimu"
@@ -137,6 +138,27 @@ def main() -> None:
         help="End offset in seconds from the beginning of the bag.",
     )
 
+    # ---- vio-check subcommand ----
+    viocheck_parser = subparsers.add_parser(
+        "vio-check",
+        help="Analyze bag for VIO readiness (frequency, jitter, IMU-camera sync).",
+    )
+    viocheck_parser.add_argument("input_bag", help="Bag directory or .mcap file")
+    viocheck_parser.add_argument("--camera", default="/camera/image_mono",
+                                 help="Camera topic (default: /camera/image_mono)")
+    viocheck_parser.add_argument("--imu",    default="/imu/data_raw",
+                                 help="IMU topic (default: /imu/data_raw)")
+    viocheck_parser.add_argument("--cam-hz", type=float, default=None,
+                                 help="Expected camera rate Hz (auto-detect if omitted)")
+    viocheck_parser.add_argument("--imu-hz", type=float, default=None,
+                                 help="Expected IMU rate Hz (auto-detect if omitted)")
+    viocheck_parser.add_argument("--gap-mult", type=float, default=3.0,
+                                 help="Gap threshold multiplier (default: 3.0×)")
+    viocheck_parser.add_argument("--min-imu-per-frame", type=int, default=10,
+                                 help="Min acceptable IMU samples per camera frame (default: 10)")
+    viocheck_parser.add_argument("--plot", action="store_true",
+                                 help="Show matplotlib plots")
+
     args = parser.parse_args()
 
     print(f"bag-tool  v{__version__}")
@@ -198,3 +220,7 @@ def main() -> None:
     elif args.command == "trim":
         print()
         run_trim(args.input_bag, args.output_bag, args.start, args.end)
+
+    elif args.command == "vio-check":
+        print()
+        run_vio_check(args)
