@@ -59,7 +59,7 @@ def main() -> None:
     convert_parser.add_argument(
         "-q", "--quick",
         action="store_true",
-        help="Only write path topics (skip per-message pose topics).",
+        help="Only write per-message pose topics (skip paths and ATE/RTE).",
     )
     convert_parser.add_argument(
         "--eval",
@@ -100,7 +100,7 @@ def main() -> None:
     align_parser.add_argument(
         "-q", "--quick",
         action="store_true",
-        help="Only write path topics (skip per-message pose topics).",
+        help="Only write per-message pose topics (skip paths and ATE/RTE).",
     )
     align_parser.add_argument(
         "--eval",

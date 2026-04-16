@@ -426,37 +426,21 @@ def write_alignment_topics(
             return {'rms_rte': rms_rte, 'jump_penalty': jump_penalty}
         return {}
 
-    conn_pose    = None if quick else _computed_conn('/ov_srvins/rtk/pose',         POSE_TYPE)
-    conn_path    = _computed_conn('/ov_srvins/rtk/path',         PATH_TYPE)
-    conn_pose_al = None if quick else _computed_conn('/ov_srvins/rtk/pose_aligned', POSE_TYPE)
-    conn_path_al = _computed_conn('/ov_srvins/rtk/path_aligned', PATH_TYPE)
-    conn_vio_path = _computed_conn('/ov_srvins/vio/path',        PATH_TYPE)
-    conn_ate      = _computed_conn('/ov_srvins/ate', 'std_msgs/msg/Float64')
-    conn_rte      = _computed_conn('/ov_srvins/rte', 'std_msgs/msg/Float64')
+    conn_pose     = _computed_conn('/ov_srvins/rtk/pose',         POSE_TYPE)
+    conn_pose_al  = _computed_conn('/ov_srvins/rtk/pose_aligned', POSE_TYPE)
+    conn_path     = None if quick else _computed_conn('/ov_srvins/rtk/path',         PATH_TYPE)
+    conn_path_al  = None if quick else _computed_conn('/ov_srvins/rtk/path_aligned', PATH_TYPE)
+    conn_vio_path = None if quick else _computed_conn('/ov_srvins/vio/path',         PATH_TYPE)
+    conn_ate      = None if quick else _computed_conn('/ov_srvins/ate', 'std_msgs/msg/Float64')
+    conn_rte      = None if quick else _computed_conn('/ov_srvins/rte', 'std_msgs/msg/Float64')
 
     if quick:
-        if out_poses:
-            path_poses = [(stamp_ns, pos, rot) for _, stamp_ns, pos, rot in out_poses]
-            first_ts, first_stamp_ns = out_poses[0][0], out_poses[0][1]
-            writer.write(conn_path, first_ts + ts_offset, typestore.serialize_cdr(
-                make_path_msg(first_stamp_ns, FRAME_ID, path_poses), PATH_TYPE))
-
-        if out_aligned:
-            path_poses_al = [(stamp_ns, pos, rot) for _, stamp_ns, pos, rot in out_aligned]
-            first_ts_al, first_stamp_ns_al = out_aligned[0][0], out_aligned[0][1]
-            writer.write(conn_path_al, first_ts_al + ts_offset, typestore.serialize_cdr(
-                make_path_msg(first_stamp_ns_al, FRAME_ID, path_poses_al), PATH_TYPE))
-
-        if posimus:
-            vio_path_poses = []
-            for vio_ts, pm in posimus:
-                pos = [pm.pose.pose.position.x, pm.pose.pose.position.y, pm.pose.pose.position.z]
-                rot = Rotation.from_quat([pm.pose.pose.orientation.x, pm.pose.pose.orientation.y,
-                                          pm.pose.pose.orientation.z, pm.pose.pose.orientation.w])
-                stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
-                vio_path_poses.append((stamp_ns, pos, rot))
-            writer.write(conn_vio_path, posimus[0][0] + ts_offset, typestore.serialize_cdr(
-                make_path_msg(vio_path_poses[0][0], FRAME_ID, vio_path_poses), PATH_TYPE))
+        for fix_ts, stamp_ns, pos, rot in out_poses:
+            writer.write(conn_pose, fix_ts + ts_offset, typestore.serialize_cdr(
+                make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
+        for fix_ts, stamp_ns, pos, rot in out_aligned:
+            writer.write(conn_pose_al, fix_ts + ts_offset, typestore.serialize_cdr(
+                make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
 
     else:
         rtk_buf = bytearray()
