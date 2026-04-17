@@ -168,7 +168,7 @@ def main() -> None:
     viocheck_parser.add_argument("--imu",    default="/imu/data_raw",
                                  help="IMU topic (default: /imu/data_raw)")
     viocheck_parser.add_argument("--rtk",    default="/m300/rtk/fix",
-                                 help="RTK fix topic to check at ~20 Hz (default: /m300/rtk/fix, pass '' to skip)")
+                                 help="RTK fix topic to check at ~5 Hz (default: /m300/rtk/fix, pass '' to skip)")
     viocheck_parser.add_argument("--cam-hz", type=float, default=None,
                                  help="Expected camera rate Hz (auto-detect if omitted)")
     viocheck_parser.add_argument("--imu-hz", type=float, default=None,

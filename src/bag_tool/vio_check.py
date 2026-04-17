@@ -517,7 +517,7 @@ def run(args) -> None:
         results[imu_topic] = r
         print_topic_report(r)
     if rtk_topic and rtk_log:
-        r = analyze_topic(rtk_topic, rtk_log, rtk_stamp, 20.0, args.gap_mult)
+        r = analyze_topic(rtk_topic, rtk_log, rtk_stamp, 5.0, args.gap_mult)
         results[rtk_topic] = r
         print_topic_report(r)
 
