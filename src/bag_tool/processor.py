@@ -144,7 +144,7 @@ def compute_alignment(
         relevant_connections = [
             connection
             for connection in reader.connections
-            if connection.topic in {'/m300/rtk/fix', '/m300/rtk/yaw', vio_topic, 'diag/tracking'}
+            if connection.topic in {'/m300/rtk/fix', '/m300/rtk/yaw', vio_topic, '/ov_srvins/diag/tracking'}
         ]
 
         for connection, timestamp, rawdata in reader.messages(connections=relevant_connections):
@@ -156,7 +156,7 @@ def compute_alignment(
                 yaws.append((timestamp, msg.data * 10.0))  # DJI publishes tenths-of-degrees
             elif topic == vio_topic:
                 posimus.append((timestamp, typestore.deserialize_cdr(rawdata, connection.msgtype)))
-            elif topic == 'diag/tracking':
+            elif topic == '/ov_srvins/diag/tracking':
                 msg = typestore.deserialize_cdr(rawdata, connection.msgtype)
                 header_ns = msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
                 for kv in msg.status[0].values:
