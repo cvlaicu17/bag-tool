@@ -88,7 +88,7 @@ def run(
             cam_to_vio_ts_offset=cam_to_vio_ts_offset,
         )
 
-    out_poses, out_aligned, posimus, typestore, input_reader_path, input_start, input_end = \
+    out_poses, out_aligned, posimus, typestore, input_reader_path, input_start, input_end, diag_tracking = \
         compute_alignment(input_bag, vio_topic, stores_enum, aruco_yaw_rad=aruco_yaw_rad)
 
     out_path = input_path.parent / (input_path.stem + '_aligned')
@@ -101,7 +101,8 @@ def run(
             metrics = write_alignment_topics(writer, typestore, out_poses, out_aligned, posimus, quick,
                                              ts_offset=ts_offset,
                                              rte_window_ns=int(rte_window * 1e9),
-                                             eval_mode=eval_mode)
+                                             eval_mode=eval_mode,
+                                             diag_tracking=diag_tracking)
 
             if not eval_mode and not quick:
                 skip = COMPUTED_TOPICS | ref_topics

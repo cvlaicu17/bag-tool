@@ -117,20 +117,22 @@ def compute_alignment(
     """Load RTK/VIO data from input_bag and compute ENU + aligned poses.
 
     Returns (out_poses, out_aligned, posimus, typestore, reader_path,
-             input_start_ns, input_end_ns).
-    out_poses   : list of (fix_ts, stamp_ns, enu_pos, rot)   — raw ENU
-    out_aligned : list of (fix_ts, stamp_ns, pos_al, rot_al) — VIO-aligned
-    posimus     : list of (timestamp_ns, msg)                — raw VIO poses
-    typestore   : rosbags typestore (needed for Phase 3 serialisation)
-    reader_path : Path that was opened (for Phase 4 passthrough in convert)
+             input_start_ns, input_end_ns, diag_tracking).
+    out_poses     : list of (fix_ts, stamp_ns, enu_pos, rot)   — raw ENU
+    out_aligned   : list of (fix_ts, stamp_ns, pos_al, rot_al) — VIO-aligned
+    posimus       : list of (timestamp_ns, msg)                — raw VIO poses
+    typestore     : rosbags typestore (needed for Phase 3 serialisation)
+    reader_path   : Path that was opened (for Phase 4 passthrough in convert)
     input_start_ns/input_end_ns : bag time bounds (for align timestamp-offset detection)
+    diag_tracking : list of (header_stamp_ns, num_feats_slam) from diag/tracking; [] if absent
     aruco_yaw_rad : pre-computed ArUco north yaw (radians); if provided, skips RTK yaw method.
     """
     typestore = get_typestore(stores_enum)
 
-    fixes   = []
-    yaws    = []
-    posimus = []
+    fixes         = []
+    yaws          = []
+    posimus       = []
+    diag_tracking = []  # (header_stamp_ns, num_feats_slam)
 
     input_path  = Path(input_bag)
     reader_path = input_path.parent if input_path.is_file() else input_path
@@ -142,7 +144,7 @@ def compute_alignment(
         relevant_connections = [
             connection
             for connection in reader.connections
-            if connection.topic in {'/m300/rtk/fix', '/m300/rtk/yaw', vio_topic}
+            if connection.topic in {'/m300/rtk/fix', '/m300/rtk/yaw', vio_topic, 'diag/tracking'}
         ]
 
         for connection, timestamp, rawdata in reader.messages(connections=relevant_connections):
@@ -154,6 +156,13 @@ def compute_alignment(
                 yaws.append((timestamp, msg.data * 10.0))  # DJI publishes tenths-of-degrees
             elif topic == vio_topic:
                 posimus.append((timestamp, typestore.deserialize_cdr(rawdata, connection.msgtype)))
+            elif topic == 'diag/tracking':
+                msg = typestore.deserialize_cdr(rawdata, connection.msgtype)
+                header_ns = msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
+                for kv in msg.status[0].values:
+                    if kv.key == 'num_feats_slam':
+                        diag_tracking.append((header_ns, int(float(kv.value))))
+                        break
 
     fixes.sort(key=lambda x: x[0])
     yaws.sort(key=lambda x: x[0])
@@ -280,7 +289,7 @@ def compute_alignment(
             out_aligned.append((fix_ts, stamp_ns, p_al, Rotation.from_quat(q_al_arr)))
 
     print(f'Emitted {len(out_poses)} RTK poses, {len(out_aligned)} aligned poses')
-    return out_poses, out_aligned, posimus, typestore, reader_path, input_start_ns, input_end_ns
+    return out_poses, out_aligned, posimus, typestore, reader_path, input_start_ns, input_end_ns, diag_tracking
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +305,7 @@ def write_alignment_topics(
     ts_offset: int = 0,
     rte_window_ns: int = 1_000_000_000,
     eval_mode: bool = False,
+    diag_tracking: list | None = None,
 ) -> None:
     """Register computed alignment connections and write all their messages."""
 
@@ -360,11 +370,12 @@ def write_alignment_topics(
         )
 
     if eval_mode:
-        conn_pose_al      = _computed_conn('/ov_srvins/rtk/pose_aligned',   POSE_TYPE)
-        conn_vio_pose     = _computed_conn('/ov_srvins/vio/pose',            POSE_TYPE)
-        conn_rte          = _computed_conn('/ov_srvins/rte',                 'std_msgs/msg/Float64')
-        conn_rms_rte      = _computed_conn('/ov_srvins/eval_rms_rte',        'std_msgs/msg/Float64')
-        conn_jump_penalty = _computed_conn('/ov_srvins/eval_jump_penalty',   'std_msgs/msg/Float64')
+        conn_pose_al       = _computed_conn('/ov_srvins/rtk/pose_aligned',    POSE_TYPE)
+        conn_vio_pose      = _computed_conn('/ov_srvins/vio/pose',            POSE_TYPE)
+        conn_rte           = _computed_conn('/ov_srvins/rte',                 'std_msgs/msg/Float64')
+        conn_rms_rte       = _computed_conn('/ov_srvins/eval_rms_rte',        'std_msgs/msg/Float64')
+        conn_jump_penalty  = _computed_conn('/ov_srvins/eval_jump_penalty',   'std_msgs/msg/Float64')
+        conn_avg_slam      = _computed_conn('/ov_srvins/eval_avg_slam_feats', 'std_msgs/msg/Float64')
 
         # Landing detection: rightmost RTK fix at or below 0.5 m ENU Z (height above takeoff).
         LANDING_ALT = 0.5  # metres
@@ -375,9 +386,11 @@ def write_alignment_topics(
                 break
         if landing_stamp_ns is not None:
             n_before = len(posimus)
-            posimus     = [(ts, pm) for ts, pm in posimus
-                           if pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec <= landing_stamp_ns]
-            out_aligned = [(ft, sn, p, r) for ft, sn, p, r in out_aligned if sn <= landing_stamp_ns]
+            posimus       = [(ts, pm) for ts, pm in posimus
+                             if pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec <= landing_stamp_ns]
+            out_aligned   = [(ft, sn, p, r) for ft, sn, p, r in out_aligned if sn <= landing_stamp_ns]
+            if diag_tracking:
+                diag_tracking = [(h, c) for h, c in diag_tracking if h <= landing_stamp_ns]
             n_dropped = n_before - len(posimus)
             print(f'Landing detected (ENU Z ≤ {LANDING_ALT}m) — dropped {n_dropped} post-landing VIO frames')
         else:
@@ -435,7 +448,17 @@ def write_alignment_topics(
             writer.write(conn_jump_penalty, first_ts + ts_offset, _ENCAP + struct.pack('<d', jump_penalty))
             print(f'RMS RTE      : {rms_rte:.4f} m')
             print(f'Jump penalty : {jump_penalty:.4f} m  (threshold={JUMP_THRESHOLD}m)')
-            return {'rms_rte': rms_rte, 'jump_penalty': jump_penalty}
+            if diag_tracking:
+                avg_slam_feats = float(np.mean([c for _, c in diag_tracking]))
+                writer.write(conn_avg_slam, first_ts + ts_offset, _ENCAP + struct.pack('<d', avg_slam_feats))
+                print(f'Avg SLAM feats: {avg_slam_feats:.1f} features/frame')
+            else:
+                avg_slam_feats = None
+                print('WARNING: diag/tracking not in bag — avg_slam_feats skipped')
+            metrics: dict = {'rms_rte': rms_rte, 'jump_penalty': jump_penalty}
+            if avg_slam_feats is not None:
+                metrics['avg_slam_feats'] = avg_slam_feats
+            return metrics
         return {}
 
     conn_pose_al  = _computed_conn('/ov_srvins/rtk/pose_aligned', POSE_TYPE)
@@ -550,7 +573,7 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
     _posimus.sort(key=lambda x: x[0])
     aruco_yaw_rad = detect_aruco_north(_reader_path_conv, _posimus, _store)
 
-    out_poses, out_aligned, posimus, typestore, reader_path, _, _ = \
+    out_poses, out_aligned, posimus, typestore, reader_path, _, _, diag_tracking = \
         compute_alignment(input_bag, vio_topic, stores_enum, aruco_yaw_rad=aruco_yaw_rad)
 
     out_dir = Path(output_bag)
@@ -560,7 +583,7 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
 
     with Writer(out_dir, version=9, storage_plugin=StoragePlugin.MCAP) as writer:
         write_alignment_topics(writer, typestore, out_poses, out_aligned, posimus, quick,
-                               eval_mode=eval_mode)
+                               eval_mode=eval_mode, diag_tracking=diag_tracking)
 
         if eval_mode or quick:
             print(f'Output bag written to: {out_dir}')
