@@ -198,6 +198,12 @@ def analyze_topic(name: str, log_times: list[int], stamp_times: list[int],
         latencies = [log_times[i] - stamp_times[i] for i in range(n)]
         ls = stats(latencies)
         result["stamp_latency"] = ls
+        threshold = ls["mean"] + 2 * ls["std"]
+        result["stamp_latency_outliers"] = [
+            ((log_times[i] - log_times[0]) / 1e9, latencies[i])
+            for i in range(n)
+            if latencies[i] > threshold
+        ]
         if ls["mean"] < -50_000_000:
             result["issues"].append(
                 f"Header stamps ahead of log time by {fmt_ns(-ls['mean'])} on average"
@@ -374,6 +380,11 @@ def print_topic_report(r: dict):
         ls = r["stamp_latency"]
         print(f"  Hdr latency: mean={fmt_ns(ls['mean'])}  std={fmt_ns(ls['std'])}  "
               f"min={fmt_ns(ls['min'])}  max={fmt_ns(ls['max'])}")
+        outliers = r.get("stamp_latency_outliers", [])
+        if outliers:
+            print(f"  Hdr latency 2σ+ outliers: {len(outliers)}")
+            for t_s, lat_ns in outliers:
+                print(f"    t={t_s:8.3f} s  latency={fmt_ns(lat_ns)}")
 
     if "stamp_interval" in r:
         si = r["stamp_interval"]
