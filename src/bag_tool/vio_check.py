@@ -110,7 +110,8 @@ def fmt_ns(ns: float) -> str:
 
 # ── Per-topic analysis ────────────────────────────────────────────────────────
 def analyze_topic(name: str, log_times: list[int], stamp_times: list[int],
-                  expected_hz: float | None, gap_mult: float = 3.0) -> dict:
+                  expected_hz: float | None, gap_mult: float = 3.0,
+                  latency_outliers: bool = True) -> dict:
     result = {"name": name, "issues": [], "pass": True}
     n = len(log_times)
     result["msg_count"] = n
@@ -198,12 +199,13 @@ def analyze_topic(name: str, log_times: list[int], stamp_times: list[int],
         latencies = [log_times[i] - stamp_times[i] for i in range(n)]
         ls = stats(latencies)
         result["stamp_latency"] = ls
-        threshold = ls["mean"] + 2 * ls["std"]
-        result["stamp_latency_outliers"] = [
-            ((log_times[i] - log_times[0]) / 1e9, latencies[i])
-            for i in range(n)
-            if latencies[i] > threshold
-        ]
+        if latency_outliers:
+            threshold = ls["mean"] + 2 * ls["std"]
+            result["stamp_latency_outliers"] = [
+                ((log_times[i] - log_times[0]) / 1e9, latencies[i])
+                for i in range(n)
+                if latencies[i] > threshold
+            ]
         if ls["mean"] < -50_000_000:
             result["issues"].append(
                 f"Header stamps ahead of log time by {fmt_ns(-ls['mean'])} on average"
@@ -561,7 +563,8 @@ def run(args) -> None:
         results[cam_topic] = r
         print_topic_report(r)
     if imu_log:
-        r = analyze_topic(imu_topic, imu_log, imu_stamp, args.imu_hz, args.gap_mult)
+        r = analyze_topic(imu_topic, imu_log, imu_stamp, args.imu_hz, args.gap_mult,
+                          latency_outliers=False)
         results[imu_topic] = r
         print_topic_report(r)
     if rtk_topic and rtk_log:
