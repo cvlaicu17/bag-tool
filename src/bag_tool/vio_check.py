@@ -206,6 +206,30 @@ def analyze_topic(name: str, log_times: list[int], stamp_times: list[int],
         if ls["std"] > 50_000_000:
             result["issues"].append(f"High latency jitter: std={fmt_ns(ls['std'])}")
 
+    # Header stamp intervals (actual capture-rate verification)
+    if stamp_times and len(stamp_times) >= 2:
+        st_ivals = intervals_ns(stamp_times)
+        si = stats(st_ivals)
+        result["stamp_interval"] = si
+        stamp_hz = hz(si["mean"])
+        result["stamp_mean_hz"] = stamp_hz
+        if abs(stamp_hz - expected_hz) / expected_hz > 0.15:
+            result["issues"].append(
+                f"Header stamp rate {stamp_hz:.1f} Hz deviates >15% from expected {expected_hz:.1f} Hz"
+            )
+            result["pass"] = False
+        st_gap_thresh = gap_mult * (1e9 / expected_hz)
+        st_gaps = [(i, v) for i, v in enumerate(st_ivals) if v > st_gap_thresh]
+        result["stamp_gaps"] = st_gaps
+        if st_gaps:
+            total_st_gap_s = sum(v for _, v in st_gaps) / 1e9
+            result["issues"].append(
+                f"{len(st_gaps)} header stamp gap(s) > {gap_mult:.1f}× expected interval "
+                f"(total lost: {total_st_gap_s:.2f} s)"
+            )
+            if len(st_gaps) > 15 or total_st_gap_s > 2.0:
+                result["pass"] = False
+
     return result
 
 
@@ -350,6 +374,19 @@ def print_topic_report(r: dict):
         ls = r["stamp_latency"]
         print(f"  Hdr latency: mean={fmt_ns(ls['mean'])}  std={fmt_ns(ls['std'])}  "
               f"min={fmt_ns(ls['min'])}  max={fmt_ns(ls['max'])}")
+
+    if "stamp_interval" in r:
+        si = r["stamp_interval"]
+        print(f"  Hdr stamp rate: {r.get('stamp_mean_hz', 0):.2f} Hz  "
+              f"mean={fmt_ns(si['mean'])}  std={fmt_ns(si['std'])}  p95={fmt_ns(si['p95'])}")
+        st_gaps = r.get("stamp_gaps", [])
+        if st_gaps:
+            print(f"  Hdr stamp gaps (>{3}× period): {len(st_gaps)} detected, "
+                  f"total={sum(v for _, v in st_gaps)/1e9:.2f} s")
+            for i, (idx, gns) in enumerate(st_gaps[:5]):
+                print(f"    gap[{i}] after msg #{idx}: {fmt_ns(gns)}")
+            if len(st_gaps) > 5:
+                print(f"    ... and {len(st_gaps) - 5} more")
 
     if gaps:
         print(f"  Gaps (>{3}× period): {len(gaps)} detected, total={r['total_gap_s']:.2f} s")
