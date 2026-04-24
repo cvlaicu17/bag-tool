@@ -130,8 +130,14 @@ def run(
         link_path = ref_path.parent / mcap_file.name
         if link_path.exists():
             link_path.unlink()
-        link_path.hardlink_to(mcap_file)
-        print(f'Hard link created: {link_path}')
+        try:
+            link_path.hardlink_to(mcap_file)
+            print(f'Hard link created: {link_path}')
+        except OSError as e:
+            if e.errno != 18:  # EXDEV — cross-device
+                raise
+            shutil.copy2(mcap_file, link_path)
+            print(f'Copied (cross-device): {link_path}')
 
         if eval_mode and metrics:
             ref_json_path = link_path.with_suffix('.json')
