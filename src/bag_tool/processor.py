@@ -399,14 +399,34 @@ def write_alignment_topics(
         for fix_ts, stamp_ns, pos, rot in out_aligned:
             writer.write(conn_pose_al, fix_ts + ts_offset, typestore.serialize_cdr(
                 make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
+
+        # Pre-process VIO frames: decode positions and substitute NaN/Inf with last valid value.
+        vio_frames: list[tuple[int, int, np.ndarray, Rotation]] = []  # (bag_ts, header_ns, pos, rot)
+        _last_valid_pos: np.ndarray | None = None
+        _last_valid_rot: Rotation | None   = None
+        n_invalid_vio = 0
         for vio_ts, pm in posimus:
             stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
             pos = np.array([pm.pose.pose.position.x, pm.pose.pose.position.y, pm.pose.pose.position.z])
             rot = Rotation.from_quat([pm.pose.pose.orientation.x, pm.pose.pose.orientation.y,
                                       pm.pose.pose.orientation.z, pm.pose.pose.orientation.w])
+            if not np.all(np.isfinite(pos)):
+                n_invalid_vio += 1
+                if _last_valid_pos is None:
+                    continue
+                pos = _last_valid_pos
+                rot = _last_valid_rot
+            else:
+                _last_valid_pos = pos
+                _last_valid_rot = rot
+            vio_frames.append((vio_ts, stamp_ns, pos, rot))
+        if n_invalid_vio:
+            print(f'WARNING: {n_invalid_vio} VIO frames with NaN/Inf replaced with last valid position')
+
+        for vio_ts, stamp_ns, pos, rot in vio_frames:
             writer.write(conn_vio_pose, vio_ts + ts_offset, typestore.serialize_cdr(
                 make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
-        if out_aligned and posimus:
+        if out_aligned and vio_frames:
             al_stamps    = [stamp_ns for _, stamp_ns, _, _ in out_aligned]
             al_positions = [pos_al   for _, _, pos_al, _ in out_aligned]
             n_al = len(al_stamps)
@@ -416,28 +436,17 @@ def write_alignment_topics(
                 if idx >= n_al: return n_al - 1
                 return idx if (al_stamps[idx] - vio_stamp_ns) <= (vio_stamp_ns - al_stamps[idx - 1]) else idx - 1
             ate_records: list[tuple[int, int, float]] = []
-            for vio_ts, pm in posimus:
-                vio_pos      = np.array([pm.pose.pose.position.x,
-                                         pm.pose.pose.position.y,
-                                         pm.pose.pose.position.z])
-                vio_stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
+            for vio_ts, vio_stamp_ns, vio_pos, _ in vio_frames:
                 ate = float(np.linalg.norm(vio_pos - al_positions[_nearest_al_eval(vio_stamp_ns)]))
                 ate_records.append((vio_ts, vio_stamp_ns, ate))
 
             # VIO-failure extension: if VIO stopped before landing, freeze last position.
             n_frozen = 0
-            if posimus and landing_stamp_ns is not None:
-                last_vio_stamp_ns = posimus[-1][1].header.stamp.sec * 10**9 \
-                                    + posimus[-1][1].header.stamp.nanosec
+            if vio_frames and landing_stamp_ns is not None:
+                last_vio_stamp_ns = vio_frames[-1][1]
                 if last_vio_stamp_ns < landing_stamp_ns:
-                    last_pm    = posimus[-1][1]
-                    frozen_pos = np.array([last_pm.pose.pose.position.x,
-                                           last_pm.pose.pose.position.y,
-                                           last_pm.pose.pose.position.z])
-                    frozen_rot = Rotation.from_quat([last_pm.pose.pose.orientation.x,
-                                                     last_pm.pose.pose.orientation.y,
-                                                     last_pm.pose.pose.orientation.z,
-                                                     last_pm.pose.pose.orientation.w])
+                    frozen_pos = vio_frames[-1][2]
+                    frozen_rot = vio_frames[-1][3]
                     for fix_ts, stamp_ns, _, _ in out_aligned:
                         if stamp_ns <= last_vio_stamp_ns:
                             continue
