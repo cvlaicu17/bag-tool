@@ -423,6 +423,32 @@ def write_alignment_topics(
                 vio_stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
                 ate = float(np.linalg.norm(vio_pos - al_positions[_nearest_al_eval(vio_stamp_ns)]))
                 ate_records.append((vio_ts, vio_stamp_ns, ate))
+
+            # VIO-failure extension: if VIO stopped before landing, freeze last position.
+            n_frozen = 0
+            if posimus and landing_stamp_ns is not None:
+                last_vio_stamp_ns = posimus[-1][1].header.stamp.sec * 10**9 \
+                                    + posimus[-1][1].header.stamp.nanosec
+                if last_vio_stamp_ns < landing_stamp_ns:
+                    last_pm    = posimus[-1][1]
+                    frozen_pos = np.array([last_pm.pose.pose.position.x,
+                                           last_pm.pose.pose.position.y,
+                                           last_pm.pose.pose.position.z])
+                    frozen_rot = Rotation.from_quat([last_pm.pose.pose.orientation.x,
+                                                     last_pm.pose.pose.orientation.y,
+                                                     last_pm.pose.pose.orientation.z,
+                                                     last_pm.pose.pose.orientation.w])
+                    for fix_ts, stamp_ns, _, _ in out_aligned:
+                        if stamp_ns <= last_vio_stamp_ns:
+                            continue
+                        ate = float(np.linalg.norm(frozen_pos - al_positions[_nearest_al_eval(stamp_ns)]))
+                        ate_records.append((fix_ts, stamp_ns, ate))
+                        writer.write(conn_vio_pose, fix_ts + ts_offset, typestore.serialize_cdr(
+                            make_pose_msg(stamp_ns, FRAME_ID, frozen_pos, frozen_rot), POSE_TYPE))
+                        n_frozen += 1
+                    if n_frozen:
+                        print(f'VIO failure detected — {n_frozen} frozen frames appended to landing')
+
             ate_header_stamps = [r[1] for r in ate_records]
             n_ate = len(ate_records)
             rte_values: list[float] = []
