@@ -13,6 +13,7 @@ from bag_tool.altimeter import run as run_compare_altimeter
 from bag_tool.convert_jazzy import run as run_convert_jazzy
 from bag_tool.add_topics import run as run_add_topics
 from bag_tool.align import run as run_align
+from bag_tool.eval import run as run_eval
 from bag_tool.vio_check import run as run_vio_check
 
 
@@ -116,6 +117,18 @@ def main() -> None:
         "--manual",
         action="store_true",
         help="Skip ArUco detection and use the RTK yaw method directly.",
+    )
+
+    # ---- eval subcommand ----
+    eval_parser = subparsers.add_parser(
+        "eval",
+        help="Compute RTE metrics from an already-aligned bag (output of align --eval).",
+    )
+    eval_parser.add_argument("aligned_bag", help="Aligned bag directory or .mcap file")
+    eval_parser.add_argument(
+        "--rte-window",
+        type=float, default=1.0, metavar="SECONDS",
+        help="Window size in seconds for relative trajectory error (default: 1.0).",
     )
 
     # ---- add-topics subcommand ----
@@ -233,6 +246,11 @@ def main() -> None:
 
         run_align(args.input_bag, vio_topic, stores, ref_bag=args.ref_bag, quick=args.quick,
                   rte_window=args.rte_window, eval_mode=args.eval, manual=args.manual)
+
+    elif args.command == "eval":
+        stores = detect_stores_enum()
+        print()
+        run_eval(args.aligned_bag, stores, rte_window_ns=int(args.rte_window * 1e9))
 
     elif args.command == "add-topics":
         print()

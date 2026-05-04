@@ -118,7 +118,9 @@ def run(
 
     print(f'Output written to: {out_path}')
 
-    if eval_mode and metrics:
+    if eval_mode:
+        if not metrics:
+            raise RuntimeError("eval_mode requested but alignment produced no metrics")
         json_path = out_path.parent / (out_path.name + '.json')
         json_path.write_text(json.dumps(metrics, indent=2))
         print(f'Eval metrics written: {json_path}')

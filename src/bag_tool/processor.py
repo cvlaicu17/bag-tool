@@ -89,6 +89,40 @@ def dji_yaw_to_enu_rad(yaw_deg: float) -> float:
     return math.radians(90.0 - yaw_deg)
 
 
+JUMP_THRESHOLD = 1.0  # metres
+
+
+def rte_values_from_ate(
+    ate_records: list[tuple[int, int, float]],
+    rte_window_ns: int,
+) -> list[float]:
+    """Compute per-frame RTE from ATE records. RTE = ATE(t) - ATE(t - window)."""
+    ate_header_stamps = [r[1] for r in ate_records]
+    n_ate = len(ate_records)
+    rte_values: list[float] = []
+    for _, vio_stamp_ns, ate in ate_records:
+        past_stamp = vio_stamp_ns - rte_window_ns
+        j = bisect.bisect_left(ate_header_stamps, past_stamp)
+        if j >= n_ate:
+            j = n_ate - 1
+        if j > 0 and (ate_header_stamps[j] - past_stamp) > (past_stamp - ate_header_stamps[j - 1]):
+            j -= 1
+        rte_values.append(ate - ate_records[j][2])
+    return rte_values
+
+
+def rms_jump_penalty(rte_values: list[float]) -> tuple[float, float]:
+    """Return (rms_rte, jump_penalty) from a list of per-frame RTE values."""
+    rte_arr = np.array(rte_values)
+    rms_rte = float(np.sqrt(np.mean(rte_arr ** 2)))
+    if len(rte_arr) > 1:
+        excess = np.maximum(0.0, np.abs(np.diff(rte_arr)) - JUMP_THRESHOLD)
+        jump_penalty = float(np.sqrt(np.sum(excess ** 2)))
+    else:
+        jump_penalty = 0.0
+    return rms_rte, jump_penalty
+
+
 # Topics written by compute_alignment / write_alignment_topics.
 # Used to exclude them from passthrough when the source bag is also the input bag.
 COMPUTED_TOPICS = frozenset({
@@ -458,26 +492,10 @@ def write_alignment_topics(
                     if n_frozen:
                         print(f'VIO failure detected — {n_frozen} frozen frames appended to landing')
 
-            ate_header_stamps = [r[1] for r in ate_records]
-            n_ate = len(ate_records)
-            rte_values: list[float] = []
-            for vio_ts, vio_stamp_ns, ate in ate_records:
-                past_stamp = vio_stamp_ns - rte_window_ns
-                j = bisect.bisect_left(ate_header_stamps, past_stamp)
-                if j >= n_ate: j = n_ate - 1
-                if j > 0 and (ate_header_stamps[j] - past_stamp) > (past_stamp - ate_header_stamps[j - 1]):
-                    j -= 1
-                rte = ate - ate_records[j][2]
-                rte_values.append(rte)
+            rte_values = rte_values_from_ate(ate_records, rte_window_ns)
+            for (vio_ts, _, _), rte in zip(ate_records, rte_values):
                 writer.write(conn_rte, vio_ts + ts_offset, _ENCAP + struct.pack('<d', rte))
-            JUMP_THRESHOLD = 1.0  # metres
-            rte_arr = np.array(rte_values)
-            rms_rte = float(np.sqrt(np.mean(rte_arr ** 2)))
-            if len(rte_arr) > 1:
-                excess       = np.maximum(0.0, np.abs(np.diff(rte_arr)) - JUMP_THRESHOLD)
-                jump_penalty = float(np.sqrt(np.sum(excess ** 2)))
-            else:
-                jump_penalty = 0.0
+            rms_rte, jump_penalty = rms_jump_penalty(rte_values)
             first_ts = ate_records[0][0]
             writer.write(conn_rms_rte,      first_ts + ts_offset, _ENCAP + struct.pack('<d', rms_rte))
             writer.write(conn_jump_penalty, first_ts + ts_offset, _ENCAP + struct.pack('<d', jump_penalty))
@@ -576,17 +594,7 @@ def write_alignment_topics(
             writer.write(conn_ate, vio_ts + ts_offset, _ENCAP + struct.pack('<d', ate))
 
         # Second pass: RTE = ate(t) - ate(t - rte_window_ns), using header stamps for the window.
-        ate_header_stamps = [r[1] for r in ate_records]
-        n_ate = len(ate_records)
-        for i, (vio_ts, vio_stamp_ns, ate) in enumerate(ate_records):
-            past_stamp = vio_stamp_ns - rte_window_ns
-            j = bisect.bisect_left(ate_header_stamps, past_stamp)
-            if j >= n_ate:
-                j = n_ate - 1
-            # Pick whichever neighbour is closer to past_stamp.
-            if j > 0 and (ate_header_stamps[j] - past_stamp) > (past_stamp - ate_header_stamps[j - 1]):
-                j -= 1
-            rte = ate - ate_records[j][2]
+        for (vio_ts, _, _), rte in zip(ate_records, rte_values_from_ate(ate_records, rte_window_ns)):
             writer.write(conn_rte, vio_ts + ts_offset, _ENCAP + struct.pack('<d', rte))
 
 
