@@ -32,3 +32,15 @@ def set_vio_topic(topic: str) -> None:
     data = _load()
     data["vio_topic"] = topic
     _save(data)
+
+
+def get_vib_ref() -> str | None:
+    """Return the stored default vibration reference bag path, or None if not set."""
+    return _load().get("vib_ref")
+
+
+def set_vib_ref(path: str) -> None:
+    """Persist path as the default vibration reference bag."""
+    data = _load()
+    data["vib_ref"] = path
+    _save(data)

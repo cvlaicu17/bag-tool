@@ -5,7 +5,7 @@ import argparse
 from pathlib import Path
 
 from bag_tool import __version__
-from bag_tool.config import get_vio_topic, set_vio_topic
+from bag_tool.config import get_vio_topic, set_vio_topic, get_vib_ref, set_vib_ref
 from bag_tool.ros2_detect import detect_ros2_distro_verbose, detect_stores_enum
 from bag_tool.processor import run as run_convert
 from bag_tool.trim import run as run_trim
@@ -15,6 +15,8 @@ from bag_tool.add_topics import run as run_add_topics
 from bag_tool.align import run as run_align
 from bag_tool.eval import run as run_eval
 from bag_tool.vio_check import run as run_vio_check
+from bag_tool.filter_imu import run as run_filter_imu
+from bag_tool.vib_check import run as run_vib_check
 
 
 _DEFAULT_VIO_TOPIC = "/ov_srvins/poseimu"
@@ -170,6 +172,43 @@ def main() -> None:
         help="End offset in seconds from the beginning of the bag.",
     )
 
+    # ---- vib-check subcommand ----
+    vibcheck_parser = subparsers.add_parser(
+        "vib-check",
+        help="Analyse IMU vibration levels (PSD, band energy, resonance detection).",
+    )
+    vibcheck_parser.add_argument("input_bag", help="Bag to analyse (.mcap file or directory)")
+    vibcheck_parser.add_argument(
+        "--set-ref", default=None, metavar="BAG",
+        help="Save BAG as the default vibration reference and use it for this run.",
+    )
+    vibcheck_parser.add_argument("--imu-topic", default="/imu/data_raw",
+                                 help="IMU topic (default: /imu/data_raw)")
+    vibcheck_parser.add_argument("--plot", action="store_true",
+                                 help="Show interactive matplotlib plot")
+    vibcheck_parser.add_argument("--save-plot", default=None, metavar="FILE",
+                                 help="Save plot to FILE instead of displaying it")
+
+    # ---- filter-imu subcommand ----
+    filterimu_parser = subparsers.add_parser(
+        "filter-imu",
+        help="Apply a low-pass filter to the IMU topic to suppress vibration.",
+    )
+    filterimu_parser.add_argument("input_bag",  help="Input bag (.mcap file or directory)")
+    filterimu_parser.add_argument("output_bag", help="Output bag directory to create")
+    filterimu_parser.add_argument(
+        "--imu-topic", default="/imu/data_raw",
+        help="IMU topic to filter (default: /imu/data_raw)",
+    )
+    filterimu_parser.add_argument(
+        "--cutoff", type=float, default=80.0, metavar="HZ",
+        help="Low-pass cutoff frequency in Hz (default: 80.0)",
+    )
+    filterimu_parser.add_argument(
+        "--order", type=int, default=4,
+        help="Butterworth filter order (default: 4)",
+    )
+
     # ---- vio-check subcommand ----
     viocheck_parser = subparsers.add_parser(
         "vio-check",
@@ -255,6 +294,26 @@ def main() -> None:
     elif args.command == "add-topics":
         print()
         run_add_topics(args.source_bag, args.dest_bag, args.topics)
+
+    elif args.command == "vib-check":
+        if args.set_ref:
+            set_vib_ref(args.set_ref)
+            print(f"Saved vibration reference: {args.set_ref}")
+        args.ref = args.set_ref or get_vib_ref()
+        if args.ref:
+            print(f"Reference : {args.ref}")
+        print()
+        run_vib_check(args)
+
+    elif args.command == "filter-imu":
+        stores = detect_stores_enum()
+        print()
+        run_filter_imu(
+            args.input_bag, args.output_bag, stores,
+            imu_topic=args.imu_topic,
+            cutoff=args.cutoff,
+            order=args.order,
+        )
 
     elif args.command == "trim":
         print()
