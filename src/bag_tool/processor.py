@@ -340,6 +340,7 @@ def write_alignment_topics(
     rte_window_ns: int = 1_000_000_000,
     eval_mode: bool = False,
     diag_tracking: list | None = None,
+    shrink: bool = False,
 ) -> None:
     """Register computed alignment connections and write all their messages."""
 
@@ -514,14 +515,15 @@ def write_alignment_topics(
             return metrics
         return {}
 
+    no_paths = quick or shrink
     conn_pose_al  = _computed_conn('/ov_srvins/rtk/pose_aligned', POSE_TYPE)
     conn_vio_pose = _computed_conn('/ov_srvins/vio/pose',         POSE_TYPE)
-    conn_pose     = None if quick else _computed_conn('/ov_srvins/rtk/pose',         POSE_TYPE)
-    conn_path     = None if quick else _computed_conn('/ov_srvins/rtk/path',         PATH_TYPE)
-    conn_path_al  = None if quick else _computed_conn('/ov_srvins/rtk/path_aligned', PATH_TYPE)
-    conn_vio_path = None if quick else _computed_conn('/ov_srvins/vio/path',         PATH_TYPE)
-    conn_ate      = None if quick else _computed_conn('/ov_srvins/ate', 'std_msgs/msg/Float64')
-    conn_rte      = None if quick else _computed_conn('/ov_srvins/rte', 'std_msgs/msg/Float64')
+    conn_pose     = None if quick    else _computed_conn('/ov_srvins/rtk/pose',         POSE_TYPE)
+    conn_path     = None if no_paths else _computed_conn('/ov_srvins/rtk/path',         PATH_TYPE)
+    conn_path_al  = None if no_paths else _computed_conn('/ov_srvins/rtk/path_aligned', PATH_TYPE)
+    conn_vio_path = None if no_paths else _computed_conn('/ov_srvins/vio/path',         PATH_TYPE)
+    conn_ate      = None if quick    else _computed_conn('/ov_srvins/ate', 'std_msgs/msg/Float64')
+    conn_rte      = None if quick    else _computed_conn('/ov_srvins/rte', 'std_msgs/msg/Float64')
 
     if quick:
         for fix_ts, stamp_ns, pos, rot in out_aligned:
@@ -539,21 +541,21 @@ def write_alignment_topics(
     else:
         rtk_buf = bytearray()
         for k, (fix_ts, stamp_ns, pos, rot) in enumerate(out_poses, 1):
-            q = rot.as_quat()
-            rtk_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
             writer.write(conn_pose, fix_ts + ts_offset, typestore.serialize_cdr(
                 make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
-            writer.write(conn_path, fix_ts + ts_offset,
-                         _path_header_cdr(stamp_ns, k) + bytes(rtk_buf))
+            if conn_path is not None:
+                rtk_buf.extend(_pose_cdr_bytes(stamp_ns, pos, rot.as_quat()))
+                writer.write(conn_path, fix_ts + ts_offset,
+                             _path_header_cdr(stamp_ns, k) + bytes(rtk_buf))
 
         al_buf = bytearray()
         for k, (fix_ts, stamp_ns, pos, rot) in enumerate(out_aligned, 1):
-            q = rot.as_quat()
-            al_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
             writer.write(conn_pose_al, fix_ts + ts_offset, typestore.serialize_cdr(
                 make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
-            writer.write(conn_path_al, fix_ts + ts_offset,
-                         _path_header_cdr(stamp_ns, k) + bytes(al_buf))
+            if conn_path_al is not None:
+                al_buf.extend(_pose_cdr_bytes(stamp_ns, pos, rot.as_quat()))
+                writer.write(conn_path_al, fix_ts + ts_offset,
+                             _path_header_cdr(stamp_ns, k) + bytes(al_buf))
 
         pose_buf = bytearray()
         for k, (vio_ts, pm) in enumerate(posimus, 1):
@@ -561,12 +563,13 @@ def write_alignment_topics(
             pos = (pm.pose.pose.position.x, pm.pose.pose.position.y, pm.pose.pose.position.z)
             q   = (pm.pose.pose.orientation.x, pm.pose.pose.orientation.y,
                    pm.pose.pose.orientation.z, pm.pose.pose.orientation.w)
-            pose_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
             rot = Rotation.from_quat(q)
             writer.write(conn_vio_pose, vio_ts + ts_offset, typestore.serialize_cdr(
                 make_pose_msg(stamp_ns, FRAME_ID, np.array(pos), rot), POSE_TYPE))
-            writer.write(conn_vio_path, vio_ts + ts_offset,
-                         _path_header_cdr(stamp_ns, k) + bytes(pose_buf))
+            if conn_vio_path is not None:
+                pose_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
+                writer.write(conn_vio_path, vio_ts + ts_offset,
+                             _path_header_cdr(stamp_ns, k) + bytes(pose_buf))
 
     # ATE + RTE: one Float64 per VIO frame (skipped in quick mode)
     if conn_ate is not None and out_aligned and posimus:

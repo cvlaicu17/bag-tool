@@ -52,6 +52,7 @@ def run(
     rte_window: float = 1.0,
     eval_mode: bool = False,
     manual: bool = False,
+    shrink: bool = False,
 ) -> None:
     """Compute RTK-VIO alignment from input_bag and write a new aligned bag next to it."""
     input_path = Path(input_bag)
@@ -102,7 +103,8 @@ def run(
                                              ts_offset=ts_offset,
                                              rte_window_ns=int(rte_window * 1e9),
                                              eval_mode=eval_mode,
-                                             diag_tracking=diag_tracking)
+                                             diag_tracking=diag_tracking,
+                                             shrink=shrink)
 
             if not eval_mode and not quick:
                 skip = COMPUTED_TOPICS | ref_topics

@@ -120,6 +120,11 @@ def main() -> None:
         action="store_true",
         help="Skip ArUco detection and use the RTK yaw method directly.",
     )
+    align_parser.add_argument(
+        "--shrink",
+        action="store_true",
+        help="Skip writing the nav_msgs/Path topics (keep poses, ATE, RTE, and passthrough).",
+    )
 
     # ---- eval subcommand ----
     eval_parser = subparsers.add_parser(
@@ -284,7 +289,8 @@ def main() -> None:
         print()
 
         run_align(args.input_bag, vio_topic, stores, ref_bag=args.ref_bag, quick=args.quick,
-                  rte_window=args.rte_window, eval_mode=args.eval, manual=args.manual)
+                  rte_window=args.rte_window, eval_mode=args.eval, manual=args.manual,
+                  shrink=args.shrink)
 
     elif args.command == "eval":
         stores = detect_stores_enum()
