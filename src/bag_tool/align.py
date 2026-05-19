@@ -1,4 +1,4 @@
-"""align: RTK-VIO alignment written back into the same bag's folder."""
+"""align: ground-truth ↔ VIO alignment written back into the same bag's folder."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from rosbags.rosbag2.writer import StoragePlugin
 from rosbags.typesys import get_typestore
 
 from bag_tool.add_topics import _add_conn, _reader_path
+from bag_tool.platforms import PlatformConfig, PLATFORMS
 from bag_tool.processor import COMPUTED_TOPICS, compute_alignment, write_alignment_topics
 
 
@@ -53,11 +54,18 @@ def run(
     eval_mode: bool = False,
     manual: bool = False,
     shrink: bool = False,
+    platform: PlatformConfig | None = None,
+    yaw_rot: int = 0,
+    out_suffix: str = '',
 ) -> None:
-    """Compute RTK-VIO alignment from input_bag and write a new aligned bag next to it."""
+    """Compute ground-truth ↔ VIO alignment from input_bag and write a new aligned bag next to it."""
+    if platform is None:
+        platform = PLATFORMS['prince']
     input_path = Path(input_bag)
 
-    # Read ref_bag metadata upfront — needed for both ts_offset and ArUco clock correction.
+    # ref_bag is used for: (1) clock-offset shift so output timestamps align with the
+    # original recording; (2) hard-link target so the aligned mcap lives next to the
+    # source bag; (3) ArUco yaw detection (prince only — gated on platform.aruco_supported below).
     ts_offset = 0
     ref_topics: frozenset[str] = frozenset()
     cam_path = _reader_path(input_path)  # fallback: camera in VIO bag itself
@@ -80,19 +88,23 @@ def run(
                   f'(input clock shifted to ref bag clock)')
         cam_path = ref_rpath
 
-    # ArUco north alignment — uses the same clock offset already computed above.
+    # ArUco north alignment — only for platforms that support it.
     aruco_yaw_rad = None
-    if not manual:
+    if platform.aruco_supported and not manual:
         aruco_yaw_rad = _detect_aruco_for_align(
             input_bag, vio_topic, stores_enum,
             cam_path=cam_path,
             cam_to_vio_ts_offset=cam_to_vio_ts_offset,
         )
 
-    out_poses, out_aligned, posimus, typestore, input_reader_path, input_start, input_end, diag_tracking = \
-        compute_alignment(input_bag, vio_topic, stores_enum, aruco_yaw_rad=aruco_yaw_rad)
+    (out_poses, out_aligned, posimus, typestore, input_reader_path,
+     input_start, input_end, diag_tracking, platform) = compute_alignment(
+        input_bag, vio_topic, stores_enum,
+        aruco_yaw_rad=aruco_yaw_rad, platform=platform, yaw_rot=yaw_rot,
+    )
 
-    out_path = input_path.parent / (input_path.stem + '_aligned')
+    suffix = f'_{out_suffix}' if out_suffix else ''
+    out_path = input_path.parent / (input_path.stem + '_aligned' + suffix)
     if out_path.exists():
         shutil.rmtree(out_path)
         print(f'Removed existing output: {out_path}')
@@ -104,7 +116,8 @@ def run(
                                              rte_window_ns=int(rte_window * 1e9),
                                              eval_mode=eval_mode,
                                              diag_tracking=diag_tracking,
-                                             shrink=shrink)
+                                             shrink=shrink,
+                                             platform=platform)
 
             if not eval_mode and not quick:
                 skip = COMPUTED_TOPICS | ref_topics

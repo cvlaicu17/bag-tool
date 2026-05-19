@@ -17,6 +17,7 @@ from bag_tool.eval import run as run_eval
 from bag_tool.vio_check import run as run_vio_check
 from bag_tool.filter_imu import run as run_filter_imu
 from bag_tool.vib_check import run as run_vib_check
+from bag_tool.platforms import PLATFORMS, detect_from_bag
 
 
 _DEFAULT_VIO_TOPIC = "/ov_srvins/poseimu"
@@ -125,6 +126,23 @@ def main() -> None:
         action="store_true",
         help="Skip writing the nav_msgs/Path topics (keep poses, ATE, RTE, and passthrough).",
     )
+    align_parser.add_argument(
+        "--platform",
+        choices=["auto", *PLATFORMS.keys()],
+        default="auto",
+        help="Ground-truth platform (default: auto-detect from input topics).",
+    )
+    align_parser.add_argument(
+        "--yaw-rot",
+        type=int, choices=[0, 1, 2, 3], default=0,
+        help="Pre-rotate ground-truth pose by N×90° around Z (default: 0). "
+             "Use to compensate for unknown IMU mounting orientation in the sensor casket.",
+    )
+    align_parser.add_argument(
+        "--out-suffix", default="", metavar="STR",
+        help="Suffix appended to the output directory name "
+             "(default: ''; use to avoid clobbering prior runs when sweeping --yaw-rot).",
+    )
 
     # ---- eval subcommand ----
     eval_parser = subparsers.add_parser(
@@ -153,7 +171,7 @@ def main() -> None:
             "  bag-tool add-topics source/ dest/ /camera/image_mono /imu/data_raw\n"
             "\n"
             "  # Merge an aligned bag's pose topics into the original bag:\n"
-            "  bag-tool add-topics my_bag_aligned/ my_bag/ /ov_srvins/rtk/pose_aligned /ov_srvins/vio/pose\n"
+            "  bag-tool add-topics my_bag_aligned/ my_bag/ /ov_srvins/gt/aligned /ov_srvins/vio/pose\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -224,8 +242,13 @@ def main() -> None:
                                  help="Camera topic (default: /camera/image_mono)")
     viocheck_parser.add_argument("--imu",    default="/imu/data_raw",
                                  help="IMU topic (default: /imu/data_raw)")
-    viocheck_parser.add_argument("--rtk",    default="/m300/rtk/fix",
-                                 help="RTK fix topic to check at ~5 Hz (default: /m300/rtk/fix, pass '' to skip)")
+    viocheck_parser.add_argument("--platform",
+                                 choices=["auto", *PLATFORMS.keys()],
+                                 default="auto",
+                                 help="Ground-truth platform (default: auto-detect from input topics).")
+    viocheck_parser.add_argument("--rtk", default=None,
+                                 help="Ground-truth topic to check at ~5 Hz "
+                                      "(default: platform.gps_topic; pass '' to skip).")
     viocheck_parser.add_argument("--cam-hz", type=float, default=None,
                                  help="Expected camera rate Hz (auto-detect if omitted)")
     viocheck_parser.add_argument("--imu-hz", type=float, default=None,
@@ -286,11 +309,19 @@ def main() -> None:
             vio_topic = stored
 
         print(f"VIO topic   : {vio_topic}")
+
+        if args.platform == "auto":
+            platform = detect_from_bag(args.input_bag)
+            print(f"Platform    : {platform.name} (auto-detected)")
+        else:
+            platform = PLATFORMS[args.platform]
+            print(f"Platform    : {platform.name}")
         print()
 
         run_align(args.input_bag, vio_topic, stores, ref_bag=args.ref_bag, quick=args.quick,
                   rte_window=args.rte_window, eval_mode=args.eval, manual=args.manual,
-                  shrink=args.shrink)
+                  shrink=args.shrink, platform=platform, yaw_rot=args.yaw_rot,
+                  out_suffix=args.out_suffix)
 
     elif args.command == "eval":
         stores = detect_stores_enum()
@@ -326,5 +357,14 @@ def main() -> None:
         run_trim(args.input_bag, args.output_bag, args.start, args.end)
 
     elif args.command == "vio-check":
+        if args.platform == "auto":
+            platform = detect_from_bag(args.input_bag)
+            print(f"Platform    : {platform.name} (auto-detected)")
+        else:
+            platform = PLATFORMS[args.platform]
+            print(f"Platform    : {platform.name}")
+        if args.rtk is None:
+            args.rtk = platform.gps_topic
+        args.platform_obj = platform
         print()
         run_vio_check(args)

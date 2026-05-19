@@ -527,6 +527,8 @@ def run(args) -> None:
     cam_topic = args.camera
     imu_topic = args.imu
     rtk_topic = args.rtk
+    platform = getattr(args, "platform_obj", None)
+    gt_label = f"{platform.name} GT" if platform else "GT"
 
     read_topics = [cam_topic, imu_topic]
     if rtk_topic:
@@ -535,8 +537,8 @@ def run(args) -> None:
     print(SEP)
     print(f"  VIO Bag Quality Report")
     print(f"  Bag    : {args.input_bag}")
-    rtk_label = f"  |  {rtk_topic}" if rtk_topic else ""
-    print(f"  Topics : {cam_topic}  |  {imu_topic}{rtk_label}")
+    rtk_descr = f"  |  {rtk_topic} ({gt_label})" if rtk_topic else ""
+    print(f"  Topics : {cam_topic}  |  {imu_topic}{rtk_descr}")
     print(SEP)
 
     print("[INFO] Reading bag …")
@@ -554,7 +556,7 @@ def run(args) -> None:
     if not imu_log:
         print(fail(f"No messages found on IMU topic '{imu_topic}'"))
     if rtk_topic and not rtk_log:
-        print(warn(f"No messages found on RTK topic '{rtk_topic}' — skipping RTK check"))
+        print(warn(f"No messages found on {gt_label} topic '{rtk_topic}' — skipping ground-truth check"))
 
     print(SEP)
     results = {}

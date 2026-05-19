@@ -12,7 +12,7 @@ from rosbags.typesys import get_typestore
 from bag_tool.add_topics import _reader_path
 from bag_tool.processor import JUMP_THRESHOLD, rms_jump_penalty, rte_values_from_ate
 
-_RTK_TOPIC = '/ov_srvins/rtk/pose_aligned'
+_GT_TOPIC = '/ov_srvins/gt/aligned'
 _VIO_TOPIC = '/ov_srvins/vio/pose'
 _POSE_TYPE = 'geometry_msgs/msg/PoseWithCovarianceStamped'
 
@@ -27,7 +27,7 @@ def run(input_bag: str, stores_enum, rte_window_ns: int = 1_000_000_000) -> None
     vio_poses: list[tuple[int, int, np.ndarray]] = []
 
     with Reader(reader_path) as reader:
-        relevant = [c for c in reader.connections if c.topic in {_RTK_TOPIC, _VIO_TOPIC}]
+        relevant = [c for c in reader.connections if c.topic in {_GT_TOPIC, _VIO_TOPIC}]
         if not relevant:
             print(f'ERROR: no aligned pose topics found in {reader_path}')
             return
@@ -39,13 +39,13 @@ def run(input_bag: str, stores_enum, rte_window_ns: int = 1_000_000_000) -> None
                 msg.pose.pose.position.y,
                 msg.pose.pose.position.z,
             ])
-            if conn.topic == _RTK_TOPIC:
+            if conn.topic == _GT_TOPIC:
                 rtk_poses.append((ts, stamp_ns, pos))
             else:
                 vio_poses.append((ts, stamp_ns, pos))
 
     if not rtk_poses or not vio_poses:
-        print(f'ERROR: aligned bag is missing {_RTK_TOPIC!r} or {_VIO_TOPIC!r}')
+        print(f'ERROR: aligned bag is missing {_GT_TOPIC!r} or {_VIO_TOPIC!r}')
         return
 
     print(f'Loaded {len(rtk_poses)} RTK poses, {len(vio_poses)} VIO poses')

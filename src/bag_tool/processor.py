@@ -1,16 +1,24 @@
 """
-Offline RTK → ENU pose converter and VIO alignment.
+Offline ground-truth → VIO alignment for multiple platforms.
 
-Reads an input ROS2 bag containing:
-  /m300/rtk/fix    sensor_msgs/NavSatFix
-  /m300/rtk/yaw    std_msgs/Float64  (degrees, clockwise from North)
-  <vio_topic>      geometry_msgs/PoseWithCovarianceStamped
+Reads an input ROS2 bag containing a platform-specific ground-truth pose source plus
+a VIO topic, and writes a new bag with the aligned ground-truth and VIO trajectories.
 
-Writes a new bag with:
-  /ov_srvins/rtk/pose          PoseWithCovarianceStamped  (ENU, starts at 0,0,0)
-  /ov_srvins/rtk/path          nav_msgs/Path
-  /ov_srvins/rtk/pose_aligned  PoseWithCovarianceStamped  (aligned to VIO frame)
-  /ov_srvins/rtk/path_aligned  nav_msgs/Path
+Platforms are described in bag_tool.platforms; their PlatformConfig drives:
+  - which topic supplies the ground-truth pose (NavSatFix vs PoseStamped)
+  - whether yaw comes from a separate topic or the pose's quaternion
+  - the source coordinate frame (geodetic, NED, ENU)
+  - the body-frame offset baked into the first-fix alignment
+
+Always written:
+  /ov_srvins/gt/aligned       PoseWithCovarianceStamped  (aligned to VIO frame)
+  /ov_srvins/gt/aligned_path  nav_msgs/Path
+  /ov_srvins/vio/pose         PoseWithCovarianceStamped
+  /ov_srvins/vio/path         nav_msgs/Path
+
+Written only when platform.emit_raw_rtk_topics (prince):
+  /ov_srvins/rtk/pose         PoseWithCovarianceStamped  (raw ENU, starts at 0,0,0)
+  /ov_srvins/rtk/path         nav_msgs/Path
 """
 
 import bisect
@@ -26,6 +34,7 @@ from rosbags.typesys import get_typestore
 from scipy.spatial.transform import Rotation
 
 from bag_tool.add_topics import _normalize_msgdef
+from bag_tool.platforms import PLATFORMS, PlatformConfig
 
 # ---------------------------------------------------------------------------
 # Fast CDR helpers for nav_msgs/Path with frame_id="global"
@@ -125,67 +134,254 @@ def rms_jump_penalty(rte_values: list[float]) -> tuple[float, float]:
 
 # Topics written by compute_alignment / write_alignment_topics.
 # Used to exclude them from passthrough when the source bag is also the input bag.
+# Superset across all platforms — safe to over-exclude.
 COMPUTED_TOPICS = frozenset({
     '/ov_srvins/rtk/pose',
     '/ov_srvins/rtk/path',
-    '/ov_srvins/rtk/pose_aligned',
-    '/ov_srvins/rtk/path_aligned',
+    '/ov_srvins/gt/aligned',
+    '/ov_srvins/gt/aligned_path',
     '/ov_srvins/vio/pose',
     '/ov_srvins/vio/path',
     '/ov_srvins/ate',
     '/ov_srvins/rte',
     '/ov_srvins/eval_rms_rte',
     '/ov_srvins/eval_jump_penalty',
+    '/ov_srvins/eval_avg_slam_feats',
 })
+
+# NED→ENU is a proper rotation (det = +1, equivalent to 180° about the (1,1,0)/√2 axis).
+# Built once at import; applied to both positions and quaternions in the altair branch.
+_R_NED_TO_ENU = Rotation.from_matrix([[0.0, 1.0, 0.0],
+                                       [1.0, 0.0, 0.0],
+                                       [0.0, 0.0, -1.0]])
 
 
 # ---------------------------------------------------------------------------
-# Phase 1 + 2: load RTK/VIO data and compute poses (no I/O side-effects)
+# Per-platform GPS readers — produce a unified list of
+# (bag_ts, stamp_ns, enu_pos, rot) records that the alignment loop consumes.
+# ---------------------------------------------------------------------------
+def _navsatfix_records(fixes, yaws):
+    """Prince path: NavSatFix lat/lon/alt + Float64 DJI yaw → ENU records."""
+    if not yaws or not fixes:
+        return []
+    records = []
+    ref_lat = ref_lon = None
+    ref_ecef = None
+    yaw_idx = 0
+    last_yaw_idx = len(yaws) - 1
+    prev_q_arr = None
+
+    for fix_ts, fix_msg in fixes:
+        lat = fix_msg.latitude
+        lon = fix_msg.longitude
+        alt = fix_msg.altitude
+        if lat == 0.0 and lon == 0.0:
+            continue
+        if ref_lat is None:
+            ref_lat, ref_lon = lat, lon
+            ref_ecef = geodetic_to_ecef(lat, lon, alt)
+            print(f'ENU origin set: lat={lat:.7f} lon={lon:.7f} alt={alt:.3f}')
+            continue
+
+        cx, cy, cz = geodetic_to_ecef(lat, lon, alt)
+        enu = ecef_to_enu(cx - ref_ecef[0], cy - ref_ecef[1], cz - ref_ecef[2],
+                          ref_lat, ref_lon)
+
+        while yaw_idx < last_yaw_idx and yaws[yaw_idx + 1][0] <= fix_ts:
+            yaw_idx += 1
+        if fix_ts <= yaws[0][0]:
+            yaw_deg = yaws[0][1]
+        elif yaw_idx >= last_yaw_idx:
+            yaw_deg = yaws[last_yaw_idx][1]
+        else:
+            before_ts, before_yaw = yaws[yaw_idx]
+            after_ts, after_yaw = yaws[yaw_idx + 1]
+            yaw_deg = before_yaw if (fix_ts - before_ts) <= (after_ts - fix_ts) else after_yaw
+
+        q_arr = Rotation.from_euler('z', dji_yaw_to_enu_rad(yaw_deg)).as_quat()
+        if prev_q_arr is not None and np.dot(q_arr, prev_q_arr) < 0:
+            q_arr = -q_arr
+        prev_q_arr = q_arr
+        rot = Rotation.from_quat(q_arr)
+
+        hdr_sec = fix_msg.header.stamp.sec
+        hdr_nsec = fix_msg.header.stamp.nanosec
+        stamp_ns = hdr_sec * 10**9 + hdr_nsec if (hdr_sec or hdr_nsec) else fix_ts
+        records.append((fix_ts, stamp_ns, enu, rot))
+    return records
+
+
+def _decode_posimus(posimus: list) -> list:
+    """Decode raw VIO PoseWithCovarianceStamped messages into a uniform
+    (bag_ts, stamp_ns, pos: np.ndarray, rot: Rotation) list.
+
+    Substitutes frames with NaN/Inf positions or zero-norm orientation quaternions
+    (OpenVINS produces these at estimator-failure boundaries) with the last valid
+    pose. Frames before the first valid pose are dropped. Prints a sanitization
+    summary if any frames were touched.
+    """
+    decoded: list = []
+    last_pos = None
+    last_rot = None
+    n_dropped = 0
+    n_replaced = 0
+    for vio_ts, pm in posimus:
+        stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
+        pos = np.array([pm.pose.pose.position.x,
+                        pm.pose.pose.position.y,
+                        pm.pose.pose.position.z])
+        q = np.array([pm.pose.pose.orientation.x,
+                      pm.pose.pose.orientation.y,
+                      pm.pose.pose.orientation.z,
+                      pm.pose.pose.orientation.w])
+        valid = (np.all(np.isfinite(pos))
+                 and np.all(np.isfinite(q))
+                 and np.linalg.norm(q) > 1e-9)
+        if not valid:
+            if last_pos is None:
+                n_dropped += 1
+                continue
+            pos = last_pos
+            rot = last_rot
+            n_replaced += 1
+        else:
+            rot = Rotation.from_quat(q)
+            last_pos = pos
+            last_rot = rot
+        decoded.append((vio_ts, stamp_ns, pos, rot))
+    if n_dropped or n_replaced:
+        print(f'WARNING: VIO sanitization — {n_dropped} dropped (no prior valid), '
+              f'{n_replaced} replaced with last valid (NaN/Inf pos or zero-norm quat)')
+    return decoded
+
+
+def _pointstamped_records(points, platform):
+    """Altair-style path with position-only GT (no quaternion).
+
+    Each output record uses a constant first-fix orientation (identity, then optionally
+    rotated by NED→ENU). With no per-sample quaternion, all aligned-pose orientations
+    will inherit `vio_init_rot` (the first VIO orientation) — useful for plotting the
+    position path in Foxglove even though the orientation axes won't be meaningful.
+    """
+    if platform.coord_frame == 'ned':
+        const_rot = _R_NED_TO_ENU
+    else:
+        const_rot = Rotation.identity()
+    records = []
+    for ts, msg in points:
+        pos = np.array([msg.point.x, msg.point.y, msg.point.z])
+        if platform.coord_frame == 'ned':
+            pos = _R_NED_TO_ENU.apply(pos)
+        stamp_ns = msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
+        if not stamp_ns:
+            stamp_ns = ts
+        records.append((ts, stamp_ns, pos, const_rot))
+    return records
+
+
+def _posestamped_records(poses, platform):
+    """Altair-style path: PoseStamped in `fc_local_ned` (or ENU) → ENU records."""
+    records = []
+    prev_q_arr = None
+    for ts, msg in poses:
+        pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
+        q = np.array([msg.pose.orientation.x, msg.pose.orientation.y,
+                      msg.pose.orientation.z, msg.pose.orientation.w])
+        if platform.coord_frame == 'ned':
+            pos = _R_NED_TO_ENU.apply(pos)
+            rot = _R_NED_TO_ENU * Rotation.from_quat(q)
+            q_arr = rot.as_quat()
+        else:
+            q_arr = q
+            rot = Rotation.from_quat(q_arr)
+        if prev_q_arr is not None and np.dot(q_arr, prev_q_arr) < 0:
+            q_arr = -q_arr
+            rot = Rotation.from_quat(q_arr)
+        prev_q_arr = q_arr
+        stamp_ns = msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
+        if not stamp_ns:
+            stamp_ns = ts
+        records.append((ts, stamp_ns, pos, rot))
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 + 2: load ground-truth/VIO data and compute poses (no I/O side-effects)
 # ---------------------------------------------------------------------------
 def compute_alignment(
     input_bag: str,
     vio_topic: str,
     stores_enum,
     aruco_yaw_rad: float | None = None,
+    platform: PlatformConfig | None = None,
+    yaw_rot: int = 0,
 ) -> tuple:
-    """Load RTK/VIO data from input_bag and compute ENU + aligned poses.
+    """Load ground-truth + VIO data and compute raw + aligned trajectories.
 
     Returns (out_poses, out_aligned, posimus, typestore, reader_path,
-             input_start_ns, input_end_ns, diag_tracking).
-    out_poses     : list of (fix_ts, stamp_ns, enu_pos, rot)   — raw ENU
-    out_aligned   : list of (fix_ts, stamp_ns, pos_al, rot_al) — VIO-aligned
+             input_start_ns, input_end_ns, diag_tracking, platform).
+    out_poses     : list of (gt_ts, stamp_ns, enu_pos, rot)    — raw ENU
+    out_aligned   : list of (gt_ts, stamp_ns, pos_al, rot_al)  — VIO-aligned
     posimus       : list of (timestamp_ns, msg)                — raw VIO poses
     typestore     : rosbags typestore (needed for Phase 3 serialisation)
-    reader_path   : Path that was opened (for Phase 4 passthrough in convert)
-    input_start_ns/input_end_ns : bag time bounds (for align timestamp-offset detection)
+    reader_path   : Path that was opened
+    input_start_ns/input_end_ns : bag time bounds
     diag_tracking : list of (header_stamp_ns, num_feats_slam) from diag/tracking; [] if absent
-    aruco_yaw_rad : pre-computed ArUco north yaw (radians); if provided, skips RTK yaw method.
+    platform      : the resolved PlatformConfig used (echoed back for write_alignment_topics)
+
+    aruco_yaw_rad : pre-computed ArUco north yaw (radians); ignored if not platform.aruco_supported.
+    yaw_rot       : int in {0,1,2,3}; pre-rotates ground-truth pose by N×90° about Z (both
+                    position and orientation) before first-fix alignment. Use to compensate
+                    for unknown IMU mounting orientation in the sensor casket.
     """
+    if platform is None:
+        platform = PLATFORMS['prince']
     typestore = get_typestore(stores_enum)
 
-    fixes         = []
-    yaws          = []
+    fixes         = []  # NavSatFix path (prince)
+    yaws          = []  # DJI yaw (prince)
+    gt_poses      = []  # PoseStamped path (altair-like, full pose)
+    gt_points     = []  # PointStamped path (altair-like, position-only)
     posimus       = []
-    diag_tracking = []  # (header_stamp_ns, num_feats_slam)
+    diag_tracking = []
+    gt_msgtype: str | None = None  # the actual GT msgtype seen in the bag
 
     input_path  = Path(input_bag)
     reader_path = input_path.parent if input_path.is_file() else input_path
+
+    wanted_topics: set[str] = {vio_topic, '/ov_srvins/diag/tracking', platform.gps_topic}
+    if platform.yaw_topic:
+        wanted_topics.add(platform.yaw_topic)
 
     with Reader(reader_path) as reader:
         input_start_ns = reader.start_time
         input_end_ns = reader.start_time + reader.duration
 
-        relevant_connections = [
-            connection
-            for connection in reader.connections
-            if connection.topic in {'/m300/rtk/fix', '/m300/rtk/yaw', vio_topic, '/ov_srvins/diag/tracking'}
-        ]
+        relevant_connections = [c for c in reader.connections if c.topic in wanted_topics]
 
         for connection, timestamp, rawdata in reader.messages(connections=relevant_connections):
             topic = connection.topic
-            if topic == '/m300/rtk/fix':
-                fixes.append((timestamp, typestore.deserialize_cdr(rawdata, connection.msgtype)))
-            elif topic == '/m300/rtk/yaw':
+            if topic == platform.gps_topic:
+                if connection.msgtype not in platform.gps_msg_types:
+                    raise ValueError(
+                        f"platform {platform.name!r} does not accept msgtype "
+                        f"{connection.msgtype!r} on {platform.gps_topic} "
+                        f"(accepted: {platform.gps_msg_types})"
+                    )
+                if gt_msgtype is None:
+                    gt_msgtype = connection.msgtype
+                msg = typestore.deserialize_cdr(rawdata, connection.msgtype)
+                if connection.msgtype == 'sensor_msgs/msg/NavSatFix':
+                    fixes.append((timestamp, msg))
+                elif connection.msgtype == 'geometry_msgs/msg/PoseStamped':
+                    gt_poses.append((timestamp, msg))
+                elif connection.msgtype == 'geometry_msgs/msg/PointStamped':
+                    gt_points.append((timestamp, msg))
+                else:
+                    raise NotImplementedError(
+                        f"no reader implemented for GT msgtype {connection.msgtype!r}"
+                    )
+            elif platform.yaw_topic is not None and topic == platform.yaw_topic:
                 msg = typestore.deserialize_cdr(rawdata, connection.msgtype)
                 yaws.append((timestamp, msg.data * 10.0))  # DJI publishes tenths-of-degrees
             elif topic == vio_topic:
@@ -200,19 +396,51 @@ def compute_alignment(
 
     fixes.sort(key=lambda x: x[0])
     yaws.sort(key=lambda x: x[0])
+    gt_poses.sort(key=lambda x: x[0])
+    gt_points.sort(key=lambda x: x[0])
     posimus.sort(key=lambda x: x[0])
 
-    if not fixes:
-        print('WARNING: no /m300/rtk/fix messages found — skipping RTK, emitting VIO path only')
-
-    if not yaws and fixes:
-        print('WARNING: no /m300/rtk/yaw messages found — skipping RTK')
-        fixes = []
+    # Dispatch by which list is populated (driven by the actual bag's msgtype, not the
+    # platform's default). A bag should contain only one of these — if both poses and
+    # points exist, prefer poses (more information).
+    if fixes:
+        if not yaws:
+            print(f'WARNING: no {platform.yaw_topic} messages found — skipping ground-truth')
+            fixes = []
+        print(f'Loaded {len(fixes)} fixes, {len(yaws)} yaw msgs, {len(posimus)} poseimu msgs')
+        gps_records = _navsatfix_records(fixes, yaws)
+    elif gt_poses:
+        print(f'Loaded {len(gt_poses)} ground-truth poses (PoseStamped), {len(posimus)} poseimu msgs')
+        gps_records = _posestamped_records(gt_poses, platform)
+    elif gt_points:
+        print(f'Loaded {len(gt_points)} ground-truth points (PointStamped, position-only), '
+              f'{len(posimus)} poseimu msgs')
+        gps_records = _pointstamped_records(gt_points, platform)
+    else:
+        print(f'WARNING: no {platform.gps_topic} messages found — '
+              f'skipping ground-truth, emitting VIO path only')
+        gps_records = []
 
     if not posimus:
         print(f'WARNING: no {vio_topic} messages — aligned topics will be empty')
 
-    print(f'Loaded {len(fixes)} fixes, {len(yaws)} yaw msgs, {len(posimus)} poseimu msgs')
+    # yaw-rot pre-rotation: rotate ground-truth POSITION (only) by N×90° around Z before
+    # first-fix alignment. Orientation is left untouched on purpose: a rotation around Z
+    # applied to both position and orientation commutes with the yaw-only first-fix
+    # alignment, so it would cancel and produce identical outputs for every N. Rotating
+    # position alone gives the user 4 visibly distinct trajectories to compare in Foxglove.
+    if yaw_rot:
+        if yaw_rot not in (0, 1, 2, 3):
+            raise ValueError(f"yaw_rot must be in {{0,1,2,3}}, got {yaw_rot}")
+        R_yawrot = Rotation.from_euler('z', yaw_rot * math.pi / 2)
+        gps_records = [(ts, sn, R_yawrot.apply(p), r) for ts, sn, p, r in gps_records]
+        print(f'Applied yaw_rot={yaw_rot} (= {yaw_rot * 90}°) pre-rotation to ground-truth position')
+
+    # Shift first record to origin so out_poses starts at (0,0,0).
+    if gps_records:
+        _, _, first_pos, _ = gps_records[0]
+        pose_offset = first_pos.copy()
+        gps_records = [(ts, sn, p - pose_offset, r) for ts, sn, p, r in gps_records]
 
     # VIO init from first poseimu message
     vio_init_pos = vio_init_rot = None
@@ -226,93 +454,52 @@ def compute_alignment(
                                             pm.pose.pose.orientation.z,
                                             pm.pose.pose.orientation.w])
 
-    # Phase 2: process fixes → ENU poses + aligned poses
-    ref_lat = ref_lon = ref_alt = None
-    ref_ecef = None
-    pose_offset   = None
+    # First-fix alignment: rotate ground-truth into VIO frame using the first matching pair.
     rtk_init_rot  = None
     align_rot     = None
-    align_rot_pos = None  # position uses an additional -90° Z correction (ENU→VIO frame)
+    align_rot_pos = None
     align_trans   = None
-    prev_q_arr    = None
     prev_q_al_arr = None
 
     out_poses   = []
     out_aligned = []
-    yaw_idx = 0
-    last_yaw_idx = len(yaws) - 1
 
-    for fix_ts, fix_msg in fixes:
-        lat = fix_msg.latitude
-        lon = fix_msg.longitude
-        alt = fix_msg.altitude
+    use_aruco = platform.aruco_supported and aruco_yaw_rad is not None
 
-        if lat == 0.0 and lon == 0.0:
-            continue
-
-        if ref_lat is None:
-            ref_lat, ref_lon, ref_alt = lat, lon, alt
-            ref_ecef = geodetic_to_ecef(lat, lon, alt)
-            print(f'ENU origin set: lat={lat:.7f} lon={lon:.7f} alt={alt:.3f}')
-            continue
-
-        cx, cy, cz = geodetic_to_ecef(lat, lon, alt)
-        dx, dy, dz = cx - ref_ecef[0], cy - ref_ecef[1], cz - ref_ecef[2]
-        enu = ecef_to_enu(dx, dy, dz, ref_lat, ref_lon)
-
-        if pose_offset is None:
-            pose_offset = enu.copy()
-        enu = enu - pose_offset
-
-        while yaw_idx < last_yaw_idx and yaws[yaw_idx + 1][0] <= fix_ts:
-            yaw_idx += 1
-
-        if fix_ts <= yaws[0][0]:
-            yaw_deg = yaws[0][1]
-        elif yaw_idx >= last_yaw_idx:
-            yaw_deg = yaws[last_yaw_idx][1]
-        else:
-            before_ts, before_yaw = yaws[yaw_idx]
-            after_ts, after_yaw = yaws[yaw_idx + 1]
-            if (fix_ts - before_ts) <= (after_ts - fix_ts):
-                yaw_deg = before_yaw
-            else:
-                yaw_deg = after_yaw
-
-        yaw_rad = dji_yaw_to_enu_rad(yaw_deg)
-        q_arr = Rotation.from_euler('z', yaw_rad).as_quat()
-        if prev_q_arr is not None and np.dot(q_arr, prev_q_arr) < 0:
-            q_arr = -q_arr
-        prev_q_arr = q_arr
-        rot = Rotation.from_quat(q_arr)
-
+    for gt_ts, stamp_ns, enu, rot in gps_records:
         if rtk_init_rot is None:
             rtk_init_rot = rot
             if vio_init_rot is not None:
-                # Always compute RTK yaw (used as fallback and for diagnostics).
                 rtk_align_rot = vio_init_rot * rtk_init_rot.inv()
                 rtk_yaw_rad   = rtk_align_rot.as_euler('zyx')[0]
 
-                if aruco_yaw_rad is not None:
+                # TODO: root-cause platform.yaw_correction_rad. Per-msgtype overrides
+                # exist because PointStamped GT (no orientation data) ends up rotated
+                # very differently from PoseStamped under our first-fix scheme.
+                # See PlatformConfig.yaw_correction_rad_by_msgtype.
+                yaw_corr = platform.yaw_correction_rad_by_msgtype.get(
+                    gt_msgtype, platform.yaw_correction_rad
+                )
+                R_corr   = Rotation.from_euler('z', yaw_corr)
+
+                if use_aruco:
                     diff_deg = math.degrees(aruco_yaw_rad - rtk_yaw_rad)
                     print(f'RTK yaw  : {math.degrees(rtk_yaw_rad):+.2f}°')
                     print(f'ArUco yaw: {math.degrees(aruco_yaw_rad):+.2f}°  (diff {diff_deg:+.2f}°)')
-                    align_rot     = Rotation.from_euler('z', aruco_yaw_rad)
-                    align_rot_pos = Rotation.from_euler('z', -math.pi / 2 + aruco_yaw_rad)
+                    align_rot     = R_corr * Rotation.from_euler('z', aruco_yaw_rad)
+                    align_rot_pos = Rotation.from_euler('z', platform.position_frame_offset_rad + aruco_yaw_rad + yaw_corr)
                     align_trans   = vio_init_pos
-                    print('RTK↔VIO alignment computed (ArUco method)')
+                    print(f'Ground-truth ↔ VIO alignment computed (ArUco method, platform={platform.name})')
                 else:
-                    align_rot     = rtk_align_rot
+                    align_rot     = R_corr * rtk_align_rot
                     # Strip pitch/roll: use only yaw for position rotation.
-                    align_rot_pos = Rotation.from_euler('z', -math.pi / 2 + rtk_yaw_rad)
+                    align_rot_pos = Rotation.from_euler('z', platform.position_frame_offset_rad + rtk_yaw_rad + yaw_corr)
                     align_trans   = vio_init_pos
-                    print('RTK↔VIO alignment computed (RTK yaw method)')
+                    print(f'Ground-truth ↔ VIO alignment computed (first-fix method, platform={platform.name})')
+                if yaw_corr:
+                    print(f'Applied platform yaw_correction = {math.degrees(yaw_corr):+.3f}° (TODO: root-cause and remove)')
 
-        hdr_sec  = fix_msg.header.stamp.sec
-        hdr_nsec = fix_msg.header.stamp.nanosec
-        stamp_ns = hdr_sec * 10**9 + hdr_nsec if (hdr_sec or hdr_nsec) else fix_ts
-
-        out_poses.append((fix_ts, stamp_ns, enu, rot))
+        out_poses.append((gt_ts, stamp_ns, enu, rot))
 
         if align_rot is not None:
             p_al = align_rot_pos.apply(enu) + align_trans
@@ -320,10 +507,11 @@ def compute_alignment(
             if prev_q_al_arr is not None and np.dot(q_al_arr, prev_q_al_arr) < 0:
                 q_al_arr = -q_al_arr
             prev_q_al_arr = q_al_arr
-            out_aligned.append((fix_ts, stamp_ns, p_al, Rotation.from_quat(q_al_arr)))
+            out_aligned.append((gt_ts, stamp_ns, p_al, Rotation.from_quat(q_al_arr)))
 
-    print(f'Emitted {len(out_poses)} RTK poses, {len(out_aligned)} aligned poses')
-    return out_poses, out_aligned, posimus, typestore, reader_path, input_start_ns, input_end_ns, diag_tracking
+    print(f'Emitted {len(out_poses)} ground-truth poses, {len(out_aligned)} aligned poses')
+    return (out_poses, out_aligned, posimus, typestore, reader_path,
+            input_start_ns, input_end_ns, diag_tracking, platform)
 
 
 # ---------------------------------------------------------------------------
@@ -341,8 +529,13 @@ def write_alignment_topics(
     eval_mode: bool = False,
     diag_tracking: list | None = None,
     shrink: bool = False,
+    platform: PlatformConfig | None = None,
 ) -> None:
     """Register computed alignment connections and write all their messages."""
+
+    if platform is None:
+        platform = PLATFORMS['prince']
+    emit_raw = platform.emit_raw_rtk_topics
 
     FRAME_ID  = 'global'
     POSE_TYPE = 'geometry_msgs/msg/PoseWithCovarianceStamped'
@@ -405,7 +598,7 @@ def write_alignment_topics(
         )
 
     if eval_mode:
-        conn_pose_al       = _computed_conn('/ov_srvins/rtk/pose_aligned',    POSE_TYPE)
+        conn_pose_al       = _computed_conn('/ov_srvins/gt/aligned',          POSE_TYPE)
         conn_vio_pose      = _computed_conn('/ov_srvins/vio/pose',            POSE_TYPE)
         conn_rte           = _computed_conn('/ov_srvins/rte',                 'std_msgs/msg/Float64')
         conn_rms_rte       = _computed_conn('/ov_srvins/eval_rms_rte',        'std_msgs/msg/Float64')
@@ -435,28 +628,7 @@ def write_alignment_topics(
             writer.write(conn_pose_al, fix_ts + ts_offset, typestore.serialize_cdr(
                 make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
 
-        # Pre-process VIO frames: decode positions and substitute NaN/Inf with last valid value.
-        vio_frames: list[tuple[int, int, np.ndarray, Rotation]] = []  # (bag_ts, header_ns, pos, rot)
-        _last_valid_pos: np.ndarray | None = None
-        _last_valid_rot: Rotation | None   = None
-        n_invalid_vio = 0
-        for vio_ts, pm in posimus:
-            stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
-            pos = np.array([pm.pose.pose.position.x, pm.pose.pose.position.y, pm.pose.pose.position.z])
-            rot = Rotation.from_quat([pm.pose.pose.orientation.x, pm.pose.pose.orientation.y,
-                                      pm.pose.pose.orientation.z, pm.pose.pose.orientation.w])
-            if not np.all(np.isfinite(pos)):
-                n_invalid_vio += 1
-                if _last_valid_pos is None:
-                    continue
-                pos = _last_valid_pos
-                rot = _last_valid_rot
-            else:
-                _last_valid_pos = pos
-                _last_valid_rot = rot
-            vio_frames.append((vio_ts, stamp_ns, pos, rot))
-        if n_invalid_vio:
-            print(f'WARNING: {n_invalid_vio} VIO frames with NaN/Inf replaced with last valid position')
+        vio_frames = _decode_posimus(posimus)
 
         for vio_ts, stamp_ns, pos, rot in vio_frames:
             writer.write(conn_vio_pose, vio_ts + ts_offset, typestore.serialize_cdr(
@@ -516,12 +688,14 @@ def write_alignment_topics(
         return {}
 
     no_paths = quick or shrink
-    conn_pose_al  = _computed_conn('/ov_srvins/rtk/pose_aligned', POSE_TYPE)
-    conn_vio_pose = _computed_conn('/ov_srvins/vio/pose',         POSE_TYPE)
-    conn_pose     = None if quick    else _computed_conn('/ov_srvins/rtk/pose',         POSE_TYPE)
-    conn_path     = None if no_paths else _computed_conn('/ov_srvins/rtk/path',         PATH_TYPE)
-    conn_path_al  = None if no_paths else _computed_conn('/ov_srvins/rtk/path_aligned', PATH_TYPE)
-    conn_vio_path = None if no_paths else _computed_conn('/ov_srvins/vio/path',         PATH_TYPE)
+    conn_pose_al  = _computed_conn('/ov_srvins/gt/aligned',      POSE_TYPE)
+    conn_vio_pose = _computed_conn('/ov_srvins/vio/pose',        POSE_TYPE)
+    conn_pose     = (None if quick or not emit_raw
+                     else _computed_conn('/ov_srvins/rtk/pose',  POSE_TYPE))
+    conn_path     = (None if no_paths or not emit_raw
+                     else _computed_conn('/ov_srvins/rtk/path',  PATH_TYPE))
+    conn_path_al  = None if no_paths else _computed_conn('/ov_srvins/gt/aligned_path', PATH_TYPE)
+    conn_vio_path = None if no_paths else _computed_conn('/ov_srvins/vio/path',        PATH_TYPE)
     conn_ate      = None if quick    else _computed_conn('/ov_srvins/ate', 'std_msgs/msg/Float64')
     conn_rte      = None if quick    else _computed_conn('/ov_srvins/rte', 'std_msgs/msg/Float64')
 
@@ -529,24 +703,21 @@ def write_alignment_topics(
         for fix_ts, stamp_ns, pos, rot in out_aligned:
             writer.write(conn_pose_al, fix_ts + ts_offset, typestore.serialize_cdr(
                 make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
-        for vio_ts, pm in posimus:
-            stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
-            pos = np.array([pm.pose.pose.position.x, pm.pose.pose.position.y, pm.pose.pose.position.z])
-            rot = Rotation.from_quat([pm.pose.pose.orientation.x, pm.pose.pose.orientation.y,
-                                      pm.pose.pose.orientation.z, pm.pose.pose.orientation.w])
+        for vio_ts, stamp_ns, pos, rot in _decode_posimus(posimus):
             writer.write(conn_vio_pose, vio_ts + ts_offset, typestore.serialize_cdr(
                 make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
         return
 
     else:
-        rtk_buf = bytearray()
-        for k, (fix_ts, stamp_ns, pos, rot) in enumerate(out_poses, 1):
-            writer.write(conn_pose, fix_ts + ts_offset, typestore.serialize_cdr(
-                make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
-            if conn_path is not None:
-                rtk_buf.extend(_pose_cdr_bytes(stamp_ns, pos, rot.as_quat()))
-                writer.write(conn_path, fix_ts + ts_offset,
-                             _path_header_cdr(stamp_ns, k) + bytes(rtk_buf))
+        if conn_pose is not None:
+            rtk_buf = bytearray()
+            for k, (fix_ts, stamp_ns, pos, rot) in enumerate(out_poses, 1):
+                writer.write(conn_pose, fix_ts + ts_offset, typestore.serialize_cdr(
+                    make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
+                if conn_path is not None:
+                    rtk_buf.extend(_pose_cdr_bytes(stamp_ns, pos, rot.as_quat()))
+                    writer.write(conn_path, fix_ts + ts_offset,
+                                 _path_header_cdr(stamp_ns, k) + bytes(rtk_buf))
 
         al_buf = bytearray()
         for k, (fix_ts, stamp_ns, pos, rot) in enumerate(out_aligned, 1):
@@ -557,22 +728,20 @@ def write_alignment_topics(
                 writer.write(conn_path_al, fix_ts + ts_offset,
                              _path_header_cdr(stamp_ns, k) + bytes(al_buf))
 
+        vio_frames = _decode_posimus(posimus)
+
         pose_buf = bytearray()
-        for k, (vio_ts, pm) in enumerate(posimus, 1):
-            stamp_ns = pm.header.stamp.sec * 10 ** 9 + pm.header.stamp.nanosec
-            pos = (pm.pose.pose.position.x, pm.pose.pose.position.y, pm.pose.pose.position.z)
-            q   = (pm.pose.pose.orientation.x, pm.pose.pose.orientation.y,
-                   pm.pose.pose.orientation.z, pm.pose.pose.orientation.w)
-            rot = Rotation.from_quat(q)
+        for k, (vio_ts, stamp_ns, pos, rot) in enumerate(vio_frames, 1):
+            q = rot.as_quat()
             writer.write(conn_vio_pose, vio_ts + ts_offset, typestore.serialize_cdr(
-                make_pose_msg(stamp_ns, FRAME_ID, np.array(pos), rot), POSE_TYPE))
+                make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
             if conn_vio_path is not None:
                 pose_buf.extend(_pose_cdr_bytes(stamp_ns, pos, q))
                 writer.write(conn_vio_path, vio_ts + ts_offset,
                              _path_header_cdr(stamp_ns, k) + bytes(pose_buf))
 
     # ATE + RTE: one Float64 per VIO frame (skipped in quick mode)
-    if conn_ate is not None and out_aligned and posimus:
+    if conn_ate is not None and out_aligned and vio_frames:
         al_stamps    = [stamp_ns for _, stamp_ns, _, _ in out_aligned]
         al_positions = [pos_al   for _, _, pos_al, _ in out_aligned]
         n_al = len(al_stamps)
@@ -587,11 +756,7 @@ def write_alignment_topics(
 
         # First pass: compute ATE for every VIO frame and record (bag_ts, header_stamp_ns, ate).
         ate_records: list[tuple[int, int, float]] = []
-        for vio_ts, pm in posimus:
-            vio_pos      = np.array([pm.pose.pose.position.x,
-                                     pm.pose.pose.position.y,
-                                     pm.pose.pose.position.z])
-            vio_stamp_ns = pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec
+        for vio_ts, vio_stamp_ns, vio_pos, _ in vio_frames:
             ate = float(np.linalg.norm(vio_pos - al_positions[_nearest_al(vio_stamp_ns)]))
             ate_records.append((vio_ts, vio_stamp_ns, ate))
             writer.write(conn_ate, vio_ts + ts_offset, _ENCAP + struct.pack('<d', ate))
@@ -619,8 +784,10 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
     _posimus.sort(key=lambda x: x[0])
     aruco_yaw_rad = detect_aruco_north(_reader_path_conv, _posimus, _store)
 
-    out_poses, out_aligned, posimus, typestore, reader_path, _, _, diag_tracking = \
-        compute_alignment(input_bag, vio_topic, stores_enum, aruco_yaw_rad=aruco_yaw_rad)
+    (out_poses, out_aligned, posimus, typestore, reader_path,
+     _, _, diag_tracking, platform) = compute_alignment(
+        input_bag, vio_topic, stores_enum, aruco_yaw_rad=aruco_yaw_rad,
+    )
 
     out_dir = Path(output_bag)
     if out_dir.exists():
@@ -629,7 +796,8 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
 
     with Writer(out_dir, version=9, storage_plugin=StoragePlugin.MCAP) as writer:
         write_alignment_topics(writer, typestore, out_poses, out_aligned, posimus, quick,
-                               eval_mode=eval_mode, diag_tracking=diag_tracking)
+                               eval_mode=eval_mode, diag_tracking=diag_tracking,
+                               platform=platform)
 
         if eval_mode or quick:
             print(f'Output bag written to: {out_dir}')
