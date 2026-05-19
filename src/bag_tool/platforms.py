@@ -110,8 +110,22 @@ def auto_detect(reader_topics: Iterable[str]) -> PlatformConfig:
 
 def detect_from_bag(input_bag: str | Path) -> PlatformConfig:
     """Open the bag, read its connection list, and dispatch to auto_detect."""
-    path = Path(input_bag)
-    reader_path = path.parent if path.is_file() else path
-    with Reader(reader_path) as reader:
-        topics = [c.topic for c in reader.connections]
+    return detect_from_bags([input_bag])
+
+
+def detect_from_bags(bags: Iterable[str | Path]) -> PlatformConfig:
+    """Auto-detect the platform from the union of topics across multiple bags.
+
+    Use this when (e.g.) the align subcommand has both an input bag (which may be
+    an OpenVINS output stripped of the source GPS topic) and a ref_bag (the original
+    recording). The GT topic that identifies the platform may only live in one of them.
+    """
+    topics: list[str] = []
+    for bag in bags:
+        if bag is None:
+            continue
+        path = Path(bag)
+        reader_path = path.parent if path.is_file() else path
+        with Reader(reader_path) as reader:
+            topics.extend(c.topic for c in reader.connections)
     return auto_detect(topics)

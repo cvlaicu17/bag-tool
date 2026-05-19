@@ -17,7 +17,7 @@ from bag_tool.eval import run as run_eval
 from bag_tool.vio_check import run as run_vio_check
 from bag_tool.filter_imu import run as run_filter_imu
 from bag_tool.vib_check import run as run_vib_check
-from bag_tool.platforms import PLATFORMS, detect_from_bag
+from bag_tool.platforms import PLATFORMS, detect_from_bag, detect_from_bags
 
 
 _DEFAULT_VIO_TOPIC = "/ov_srvins/poseimu"
@@ -311,7 +311,10 @@ def main() -> None:
         print(f"VIO topic   : {vio_topic}")
 
         if args.platform == "auto":
-            platform = detect_from_bag(args.input_bag)
+            # Look at both input_bag and ref_bag — the GT topic that identifies the
+            # platform may only live in one of them (e.g., OpenVINS output as input,
+            # original recording as ref_bag).
+            platform = detect_from_bags([args.input_bag, args.ref_bag])
             print(f"Platform    : {platform.name} (auto-detected)")
         else:
             platform = PLATFORMS[args.platform]
