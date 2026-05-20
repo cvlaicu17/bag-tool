@@ -12,6 +12,7 @@ from bag_tool.trim import run as run_trim
 from bag_tool.altimeter import run as run_compare_altimeter
 from bag_tool.convert_jazzy import run as run_convert_jazzy
 from bag_tool.add_topics import run as run_add_topics
+from bag_tool.add_paths import run as run_add_paths
 from bag_tool.align import run as run_align
 from bag_tool.eval import run as run_eval
 from bag_tool.vio_check import run as run_vio_check
@@ -179,6 +180,21 @@ def main() -> None:
     addtopics_parser.add_argument("dest_bag",   help="Existing bag to append topics INTO (modified in-place)")
     addtopics_parser.add_argument("topics", nargs="*", help="Topic name(s) to copy (default: all topics in source bag)")
 
+    # ---- add-paths subcommand ----
+    addpaths_parser = subparsers.add_parser(
+        "add-paths",
+        help="Generate accumulated nav_msgs/Path topics from poses in a bag.",
+        description=(
+            "Take a poses-only bag and produce a sibling bag containing accumulated\n"
+            "nav_msgs/Path messages, one per pose, derived from every pose-like topic\n"
+            "found in the input. Output is written to <input_stem>_paths/ next to the\n"
+            "input bag. /tf_static is passed through so the output bag is viewable\n"
+            "standalone in Foxglove."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    addpaths_parser.add_argument("input_bag", help="Bag with pose topics (.mcap file or directory)")
+
     # ---- trim subcommand ----
     trim_parser = subparsers.add_parser(
         "trim",
@@ -334,6 +350,11 @@ def main() -> None:
     elif args.command == "add-topics":
         print()
         run_add_topics(args.source_bag, args.dest_bag, args.topics)
+
+    elif args.command == "add-paths":
+        stores = detect_stores_enum()
+        print()
+        run_add_paths(args.input_bag, stores)
 
     elif args.command == "vib-check":
         if args.set_ref:
