@@ -442,17 +442,30 @@ def compute_alignment(
         pose_offset = first_pos.copy()
         gps_records = [(ts, sn, p - pose_offset, r) for ts, sn, p, r in gps_records]
 
-    # VIO init from first poseimu message
+    # VIO init from the first VALID poseimu message. Some recordings have NaN
+    # positions or zero-norm orientation quaternions at the head (e.g. when the
+    # rosbag2 recorder lost transport-layer messages and the estimator hadn't yet
+    # produced anything publishable); scipy's Rotation.from_quat raises on those,
+    # so skip ahead to the first frame that parses cleanly.
     vio_init_pos = vio_init_rot = None
-    if posimus:
-        _, pm = posimus[0]
-        vio_init_pos = np.array([pm.pose.pose.position.x,
-                                  pm.pose.pose.position.y,
-                                  pm.pose.pose.position.z])
-        vio_init_rot = Rotation.from_quat([pm.pose.pose.orientation.x,
-                                            pm.pose.pose.orientation.y,
-                                            pm.pose.pose.orientation.z,
-                                            pm.pose.pose.orientation.w])
+    n_skipped_for_init = 0
+    for _, pm in posimus:
+        pos = np.array([pm.pose.pose.position.x,
+                        pm.pose.pose.position.y,
+                        pm.pose.pose.position.z])
+        q = np.array([pm.pose.pose.orientation.x,
+                      pm.pose.pose.orientation.y,
+                      pm.pose.pose.orientation.z,
+                      pm.pose.pose.orientation.w])
+        if (np.all(np.isfinite(pos))
+                and np.all(np.isfinite(q))
+                and np.linalg.norm(q) > 1e-9):
+            vio_init_pos = pos
+            vio_init_rot = Rotation.from_quat(q)
+            break
+        n_skipped_for_init += 1
+    if n_skipped_for_init:
+        print(f'Skipped {n_skipped_for_init} invalid leading VIO frame(s) before finding init pose')
 
     # First-fix alignment: rotate ground-truth into VIO frame using the first matching pair.
     rtk_init_rot  = None
