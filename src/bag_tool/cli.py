@@ -282,6 +282,8 @@ def main() -> None:
                                       "the on-ground baro average is used as the constant bias (default: 1.0)")
     viocheck_parser.add_argument("--no-baro", action="store_true",
                                  help="Skip the barometer-vs-GT analysis")
+    viocheck_parser.add_argument("--no-baro-baseline", action="store_true",
+                                 help="Don't compare barometer metrics to the baked-in Day20 baseline")
     viocheck_parser.add_argument("--plot", action="store_true",
                                  help="Show matplotlib plots")
 

@@ -396,18 +396,18 @@ def read_baro_gt(bag_path: str, baro_topic: str, gt_topic: str):
     return (np.array(bt), np.array(br), np.array(gt), np.array(gv))
 
 
-def analyze_barometer(bag_path: str, baro_topic: str, gt_topic: str,
-                      ground_h: float = 1.0, fly_h: float = 3.0) -> dict:
-    """Profile barometer vs GT altitude: ground-referenced bias, scale, HF noise,
-    transient spikes, on-ground fraction. Bias = mean baro while on-ground (GPS)."""
-    r = {"name": "Barometer", "topic": baro_topic, "issues": [], "pass": True,
-         "available": False}
+def baro_metrics_from_arrays(bt, br, gt, gv, ground_h: float = 1.0,
+                             fly_h: float = 3.0) -> dict:
+    """Pure-array core of the barometer profile (no I/O). Inputs are numpy arrays:
+    baro stamp times (s) + range (m), GT stamp times (s) + vertical value. Returns
+    the metrics dict. Shared by vio-check AND the Day20 baseline generator so the
+    baseline is computed by exactly the same math the live check uses."""
+    r = {"name": "Barometer", "issues": [], "pass": True, "available": False}
     if not HAS_NUMPY:
         r["issues"].append("numpy required for barometer analysis")
         return r
     from numpy.lib.stride_tricks import sliding_window_view as swv
 
-    bt, br, gt, gv = read_baro_gt(bag_path, baro_topic, gt_topic)
     r["n_baro"], r["n_gt"] = len(br), len(gv)
     if len(br) < 10 or len(gv) < 5:
         r["issues"].append(f"insufficient data (baro={len(br)}, gt={len(gv)})")
@@ -501,6 +501,20 @@ def analyze_barometer(bag_path: str, baro_topic: str, gt_topic: str,
     return r
 
 
+def analyze_barometer(bag_path: str, baro_topic: str, gt_topic: str,
+                      ground_h: float = 1.0, fly_h: float = 3.0) -> dict:
+    """Profile barometer vs GT altitude: ground-referenced bias, scale, HF noise,
+    transient spikes, on-ground fraction. Bias = mean baro while on-ground (GPS).
+    Reads the bag, then delegates to baro_metrics_from_arrays()."""
+    if not HAS_NUMPY:
+        return {"name": "Barometer", "topic": baro_topic, "issues":
+                ["numpy required for barometer analysis"], "pass": True, "available": False}
+    bt, br, gt, gv = read_baro_gt(bag_path, baro_topic, gt_topic)
+    r = baro_metrics_from_arrays(bt, br, gt, gv, ground_h, fly_h)
+    r["topic"] = baro_topic
+    return r
+
+
 def print_baro_report(r: dict, gt_label: str = "GT"):
     if not r.get("available"):
         print(f"\n{hdr('Barometer vs ' + gt_label)}  [{warn('SKIPPED')}]")
@@ -525,6 +539,34 @@ def print_baro_report(r: dict, gt_label: str = "GT"):
         print(f"  Transients    : {ok('none >3σ')}")
     for issue in r["issues"]:
         print(f"  {warn(issue)}")
+    if r.get("compare_baseline"):
+        print_baro_baseline_comparison(r)
+
+
+def print_baro_baseline_comparison(r: dict):
+    """Compare this bag's barometer metrics to the baked-in Day20 baseline."""
+    try:
+        from bag_tool.baro_baseline import DAY20_BARO_AGG, BARO_METRICS
+    except Exception:
+        return
+    n = DAY20_BARO_AGG.get("scale_pct", {}).get("n", 0)
+    print(f"  {C.BOLD}vs Day20 baseline{C.RESET} (n={n} flights):")
+    for k, (label, fmt) in BARO_METRICS.items():
+        cur = r.get(k)
+        if cur is None or k not in DAY20_BARO_AGG:
+            continue
+        agg = DAY20_BARO_AGG[k]
+        rng = agg["max"] - agg["min"]
+        pad = 0.25 * rng if rng > 0 else max(abs(agg["mean"]) * 0.1, 1e-6)
+        if cur < agg["min"] - pad:
+            mark = warn("below Day20 range")
+        elif cur > agg["max"] + pad:
+            mark = warn("above Day20 range")
+        else:
+            mark = ok("within Day20 range")
+        cur_s = fmt.format(cur); mean_s = fmt.format(agg["mean"])
+        lo_s = fmt.format(agg["min"]); hi_s = fmt.format(agg["max"])
+        print(f"    {label:14s}: {cur_s:>11s}   Day20 {mean_s} [{lo_s} … {hi_s}]   {mark}")
 
 
 # ── Report printers ───────────────────────────────────────────────────────────
@@ -773,6 +815,7 @@ def run(args) -> None:
                 args.input_bag, baro_topic, rtk_topic,
                 ground_h=getattr(args, "baro_ground_h", 1.0),
             )
+            baro_result["compare_baseline"] = not getattr(args, "no_baro_baseline", False)
             print_baro_report(baro_result, gt_label)
         else:
             print(f"\n{warn('Barometer analysis skipped: no GT altitude topic (platform GPS topic)')}")
