@@ -361,6 +361,172 @@ def analyze_cam_imu_sync(cam_stamps: list[int], imu_stamps: list[int],
     return result
 
 
+# ── Barometer vs GT analysis ──────────────────────────────────────────────────
+def read_baro_gt(bag_path: str, baro_topic: str, gt_topic: str):
+    """Read raw values: barometer range (sensor_msgs/Range) and GT vertical.
+
+    GT vertical is taken from .point.z (PointStamped), .pose.position.z
+    (PoseStamped) or .altitude (NavSatFix). Uses the ROS2_HUMBLE typestore so a
+    Range message recorded without the Jazzy `variance` field deserialises.
+    Returns (baro_t, baro_range, gt_t, gt_vert) as numpy arrays (seconds).
+    """
+    from rosbags.rosbag2 import Reader
+    from rosbags.typesys import Stores, get_typestore
+    ts = get_typestore(Stores.ROS2_HUMBLE)
+    bt, br, gt, gv = [], [], [], []
+    path = Path(bag_path)
+    reader_path = path.parent if path.is_file() else path
+    want = {baro_topic, gt_topic}
+    with Reader(reader_path) as reader:
+        conns = [c for c in reader.connections if c.topic in want]
+        for conn, _ts, raw in reader.messages(connections=conns):
+            try:
+                m = ts.deserialize_cdr(raw, conn.msgtype)
+            except Exception:
+                continue
+            stamp = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9
+            if conn.topic == baro_topic:
+                bt.append(stamp); br.append(float(m.range))
+            else:
+                if hasattr(m, "point"):     v = m.point.z
+                elif hasattr(m, "pose"):    v = m.pose.position.z
+                elif hasattr(m, "altitude"): v = m.altitude
+                else:                        continue
+                gt.append(stamp); gv.append(float(v))
+    return (np.array(bt), np.array(br), np.array(gt), np.array(gv))
+
+
+def analyze_barometer(bag_path: str, baro_topic: str, gt_topic: str,
+                      ground_h: float = 1.0, fly_h: float = 3.0) -> dict:
+    """Profile barometer vs GT altitude: ground-referenced bias, scale, HF noise,
+    transient spikes, on-ground fraction. Bias = mean baro while on-ground (GPS)."""
+    r = {"name": "Barometer", "topic": baro_topic, "issues": [], "pass": True,
+         "available": False}
+    if not HAS_NUMPY:
+        r["issues"].append("numpy required for barometer analysis")
+        return r
+    from numpy.lib.stride_tricks import sliding_window_view as swv
+
+    bt, br, gt, gv = read_baro_gt(bag_path, baro_topic, gt_topic)
+    r["n_baro"], r["n_gt"] = len(br), len(gv)
+    if len(br) < 10 or len(gv) < 5:
+        r["issues"].append(f"insufficient data (baro={len(br)}, gt={len(gv)})")
+        return r
+
+    bi = np.argsort(bt); bt, br = bt[bi], br[bi]
+    gi = np.argsort(gt); gt, gv = gt[gi], gv[gi]
+    r["rate_hz"] = round(len(br) / (bt[-1] - bt[0]), 1) if bt[-1] > bt[0] else 0.0
+    lo, hi = max(bt[0], gt[0]), min(bt[-1], gt[-1])
+    mk = (bt >= lo) & (bt <= hi); bt, br = bt[mk], br[mk]
+    if len(br) < 10:
+        r["issues"].append("no baro/GT time overlap")
+        return r
+    g_at = np.interp(bt, gt, gv)
+    if np.std(g_at) < 1e-6 or np.std(br) < 1e-6:
+        r["issues"].append("degenerate baro/GT variance")
+        return r
+
+    # orient GT so it increases with altitude (handles NED z-down vs ENU/altitude)
+    sign = 1.0 if np.corrcoef(br, g_at)[0, 1] >= 0 else -1.0
+    g_up = sign * g_at
+    # zero the height datum at the on-ground GPS level (two-pass): rough ground from
+    # the 1st percentile, then refine to the mean over the rough on-ground samples so
+    # height≈0 on the ground (makes the on-ground residual and scale datum consistent).
+    ground_ref = np.percentile(g_up, 1.0)
+    prelim_og = (g_up - ground_ref) < ground_h
+    if prelim_og.sum() >= 10:
+        ground_ref = float(np.mean(g_up[prelim_og]))
+    height = g_up - ground_ref                   # ~0 on the ground, + aloft
+    onground = height < ground_h
+    fly = height > fly_h
+    r["available"] = True
+    r["gt_sign"] = "-z (NED)" if sign < 0 else "+z/alt"
+    r["pct_on_ground"] = round(100 * float(onground.mean()), 1)
+    if fly.sum() < 30:
+        r["issues"].append("too few in-flight samples to fit")
+        r["pass"] = False
+        return r
+
+    def rob(x):
+        m = float(np.median(x)); return m, float(1.4826 * np.median(np.abs(x - m)))
+
+    # constant bias = mean baro while on the ground (GPS-defined) — zeroes baro on ground
+    if onground.sum() >= 10:
+        bias = float(np.mean(br[onground])); r["bias_src"] = "on-ground GPS mean"
+    else:
+        bias = float(np.median(br[fly] - height[fly])); r["bias_src"] = "fallback (few on-ground)"
+    r["ground_bias_m"] = round(bias, 3)
+    err_bias = (br - bias) - height          # error after ground-bias only (still has scale)
+    r["resid_sigma_raw_m"] = round(rob(err_bias[fly])[1], 3)
+    if onground.sum():
+        r["onground_resid_m"] = round(float(np.median(err_bias[onground])), 3)
+
+    # altitude scale + unexplained residual + spikes use the BEST-FIT line (free
+    # offset) so the residual is the cleanest possible — this isolates the genuine
+    # altitude-proportional error and makes transient detection robust.
+    A = np.vstack([height[fly], np.ones(int(fly.sum()))]).T
+    (a_fit, b_fit), *_ = np.linalg.lstsq(A, br[fly], rcond=None)
+    r["scale_pct"] = round(100 * (a_fit - 1), 2)
+    resid = br - (a_fit * height + b_fit)    # best-fit residual (unexplained error)
+    med, sig = rob(resid[fly]); sig = max(sig, 1e-4)
+    r["resid_sigma_m"] = round(sig, 3)
+    # high-frequency sensor noise: residual minus ~2 s rolling median
+    w = max(5, int(round(2 * (r["rate_hz"] or 1))) | 1)
+    pad = np.pad(resid, (w // 2, w // 2), mode="edge")
+    trend = np.median(swv(pad, w), axis=1)[:len(resid)]
+    hf = (resid - trend)[fly]
+    r["noise_sigma_m"] = round(float(1.4826 * np.median(np.abs(hf - np.median(hf)))), 3)
+    # transient spikes: >3σ of the best-fit residual (in flight)
+    dev = np.abs(resid - med)
+    spike = fly & (dev > 3 * sig)
+    r["spikes"] = int(spike.sum())
+    r["spikes_pct"] = round(100 * spike.sum() / max(int(fly.sum()), 1), 2)
+    if spike.any():
+        tt = bt - bt[0]; ii = np.where(spike)[0]; worst = ii[int(np.argmax(dev[ii]))]
+        r["worst_spike_m"] = round(float(resid[worst] - med), 2)
+        r["worst_spike_t"] = round(float(tt[worst]), 1)
+        near = spike & (np.abs(tt - tt[worst]) < 5)
+        r["worst_cluster_s"] = round(float(tt[near].max() - tt[near].min()), 1)
+
+    # verdicts (informational; only severe sensor faults fail the bag)
+    if abs(r["scale_pct"]) > 15:
+        r["issues"].append(f"large altitude scale error {r['scale_pct']:+.1f}%")
+    if r["noise_sigma_m"] > 0.30:
+        r["issues"].append(f"high HF noise σ={r['noise_sigma_m']:.2f} m (sensor/housing?)")
+        r["pass"] = False
+    if r["spikes_pct"] > 3:
+        r["issues"].append(f"{r['spikes_pct']:.1f}% of flight is >3σ pressure disturbance")
+    if abs(r.get("worst_spike_m", 0)) > 6:
+        r["issues"].append(f"large transient {r['worst_spike_m']:+.1f} m at t={r['worst_spike_t']}s")
+    return r
+
+
+def print_baro_report(r: dict, gt_label: str = "GT"):
+    if not r.get("available"):
+        print(f"\n{hdr('Barometer vs ' + gt_label)}  [{warn('SKIPPED')}]")
+        for issue in r["issues"]:
+            print(f"  {warn(issue)}")
+        return
+    status = ok("PASS") if r["pass"] else fail("FAIL")
+    print(f"\n{hdr('Barometer vs ' + gt_label)}  [{status}]")
+    print(f"  Topic    : {r['topic']}   samples: {r['n_baro']:,} @ {r.get('rate_hz',0):.1f} Hz"
+          f"   GT sign: {r.get('gt_sign','?')}")
+    print(f"  On-ground (GPS) : {r.get('pct_on_ground',0):.1f}% of samples")
+    print(f"  Constant bias : {r.get('ground_bias_m',0):+.3f} m  ({r.get('bias_src','')})"
+          f"   on-ground residual {r.get('onground_resid_m',0):+.2f} m (→0 target)")
+    print(f"  Altitude scale: {r.get('scale_pct',0):+.2f}%   (bias+scale removed)")
+    print(f"  HF noise σ    : {r.get('noise_sigma_m',0):.3f} m   "
+          f"residual σ: {r.get('resid_sigma_raw_m',0):.2f} → {r.get('resid_sigma_m',0):.2f} m (after bias+scale)")
+    if r.get("spikes", 0):
+        print(f"  Transients    : {r['spikes']} samples >3σ ({r['spikes_pct']:.1f}% of flight)"
+              + (f"; worst {r['worst_spike_m']:+.1f} m at t={r['worst_spike_t']}s "
+                 f"(~{r.get('worst_cluster_s',0):.1f}s)" if 'worst_spike_m' in r else ""))
+    else:
+        print(f"  Transients    : {ok('none >3σ')}")
+    for issue in r["issues"]:
+        print(f"  {warn(issue)}")
+
+
 # ── Report printers ───────────────────────────────────────────────────────────
 def print_topic_report(r: dict):
     status = ok("PASS") if r["pass"] else fail("FAIL")
@@ -596,7 +762,24 @@ def run(args) -> None:
     )
     print_sync_report(sync_result)
 
+    # ── Barometer vs GT altitude ──
+    baro_topic = getattr(args, "baro", "") or ""
+    baro_result = None
+    if baro_topic and not getattr(args, "no_baro", False):
+        if rtk_topic:
+            print(SEP)
+            print("[INFO] Profiling barometer vs GT altitude …")
+            baro_result = analyze_barometer(
+                args.input_bag, baro_topic, rtk_topic,
+                ground_h=getattr(args, "baro_ground_h", 1.0),
+            )
+            print_baro_report(baro_result, gt_label)
+        else:
+            print(f"\n{warn('Barometer analysis skipped: no GT altitude topic (platform GPS topic)')}")
+
     all_pass = all(v["pass"] for v in results.values()) and sync_result["pass"]
+    if baro_result is not None and baro_result.get("available"):
+        all_pass = all_pass and baro_result["pass"]
     print(f"\n{SEP}")
     if all_pass:
         print(f"  Overall: {ok('BAG IS READY FOR VIO')}")

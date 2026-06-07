@@ -251,7 +251,8 @@ def main() -> None:
     # ---- vio-check subcommand ----
     viocheck_parser = subparsers.add_parser(
         "vio-check",
-        help="Analyze bag for VIO readiness (frequency, jitter, IMU-camera sync).",
+        help="Analyze bag for VIO readiness (frequency, jitter, IMU-camera sync, "
+             "barometer-vs-GT error profile).",
     )
     viocheck_parser.add_argument("input_bag", help="Bag directory or .mcap file")
     viocheck_parser.add_argument("--camera", default="/camera/image_mono",
@@ -273,6 +274,14 @@ def main() -> None:
                                  help="Gap threshold multiplier (default: 3.0×)")
     viocheck_parser.add_argument("--min-imu-per-frame", type=int, default=10,
                                  help="Min acceptable IMU samples per camera frame (default: 10)")
+    viocheck_parser.add_argument("--baro", default="/altimeter/range",
+                                 help="Barometer topic (sensor_msgs/Range) to profile vs GT "
+                                      "altitude (default: /altimeter/range; pass '' to skip)")
+    viocheck_parser.add_argument("--baro-ground-h", type=float, default=1.0,
+                                 help="GPS height (m above takeoff) below which counts as on-ground; "
+                                      "the on-ground baro average is used as the constant bias (default: 1.0)")
+    viocheck_parser.add_argument("--no-baro", action="store_true",
+                                 help="Skip the barometer-vs-GT analysis")
     viocheck_parser.add_argument("--plot", action="store_true",
                                  help="Show matplotlib plots")
 
