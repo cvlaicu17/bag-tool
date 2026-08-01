@@ -141,9 +141,11 @@ def analyze(d: dict, fs: float = 400.0) -> dict:
 
     f, psd = welch(acc_ac, fs=fs, nperseg=min(2048, len(acc_ac) // 4))
 
+    _trap = getattr(np, "trapezoid", None) or np.trapz  # numpy>=2.0 renamed trapz→trapezoid
+
     def band_rms(flo, fhi):
         mask = (f >= flo) & (f < fhi)
-        return float(np.sqrt(np.trapezoid(psd[mask], f[mask])))
+        return float(np.sqrt(_trap(psd[mask], f[mask])))
 
     low_rms   = band_rms(0,   20)
     motor_rms = band_rms(20,  100)
