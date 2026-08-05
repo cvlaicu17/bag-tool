@@ -86,6 +86,26 @@ PLATFORMS: dict[str, PlatformConfig] = {
             'geometry_msgs/msg/PointStamped': -2.337944,
         },
     ),
+    # PAS-simulated missions from eagle-nest (pas_native_* bags). Publishes the
+    # same GT topic as altair but the GT is exact sim kinematics in a clean NED
+    # frame — no casket-mount yaw bias, so NO yaw_correction (applying altair's
+    # -12.22 deg hack to sim bags inflated reported ATE ~3x). Distinguished from
+    # altair by the sim-only /camera/depth topic; that topic lives in the INPUT
+    # (ref) bag, not the VIO result bag, so auto-detection needs the ref bag
+    # passed too (rosassist does) — otherwise pass --platform alexios.
+    'alexios': PlatformConfig(
+        name='alexios',
+        gps_topic='/pf_geo_loc/fc_local_position',
+        gps_msg_types=('geometry_msgs/msg/PoseStamped',),
+        yaw_source='pose_quaternion',
+        yaw_topic=None,
+        coord_frame='ned',
+        position_frame_offset_rad=0.0,
+        detect_topics=('/pf_geo_loc/fc_local_position', '/camera/depth'),
+        aruco_supported=False,
+        emit_raw_rtk_topics=False,
+        yaw_correction_rad=0.0,
+    ),
 }
 
 
@@ -101,6 +121,13 @@ def auto_detect(reader_topics: Iterable[str]) -> PlatformConfig:
             f"(known platforms: {', '.join(PLATFORMS)})"
         )
     if len(matches) > 1:
+        # Prefer the most specific match: a platform whose detect_topics are a
+        # strict superset of every other match's (e.g. alexios sim bags also
+        # carry altair's GT topic). Only raise when specificity ties.
+        matches.sort(key=lambda cfg: len(cfg.detect_topics), reverse=True)
+        top = set(matches[0].detect_topics)
+        if all(set(m.detect_topics) < top for m in matches[1:]):
+            return matches[0]
         names = ', '.join(m.name for m in matches)
         raise ValueError(
             f"platform auto-detection is ambiguous ({names}); specify --platform"
