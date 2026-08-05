@@ -44,3 +44,15 @@ def set_vib_ref(path: str) -> None:
     data = _load()
     data["vib_ref"] = path
     _save(data)
+
+
+def get_vib_targets() -> str | None:
+    """Return the stored default vibration-verification targets JSON path, or None."""
+    return _load().get("vib_targets")
+
+
+def set_vib_targets(path: str) -> None:
+    """Persist path as the default vibration-verification targets JSON."""
+    data = _load()
+    data["vib_targets"] = path
+    _save(data)

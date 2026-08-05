@@ -5,7 +5,8 @@ import argparse
 from pathlib import Path
 
 from bag_tool import __version__
-from bag_tool.config import get_vio_topic, set_vio_topic, get_vib_ref, set_vib_ref
+from bag_tool.config import (get_vio_topic, set_vio_topic, get_vib_ref, set_vib_ref,
+                             get_vib_targets, set_vib_targets)
 from bag_tool.ros2_detect import detect_ros2_distro_verbose, detect_stores_enum
 from bag_tool.processor import run as run_convert
 from bag_tool.trim import run as run_trim
@@ -18,6 +19,7 @@ from bag_tool.eval import run as run_eval
 from bag_tool.vio_check import run as run_vio_check
 from bag_tool.filter_imu import run as run_filter_imu
 from bag_tool.vib_check import run as run_vib_check
+from bag_tool.vib_verify import run as run_vib_verify, measure_targets as vib_measure_targets
 from bag_tool.platforms import PLATFORMS, detect_from_bag, detect_from_bags
 
 
@@ -228,6 +230,26 @@ def main() -> None:
     vibcheck_parser.add_argument("--save-plot", default=None, metavar="FILE",
                                  help="Save plot to FILE instead of displaying it")
 
+    # ---- vib-verify subcommand ----
+    vibverify_parser = subparsers.add_parser(
+        "vib-verify",
+        help="Phase-resolved vibration verification of a bag against a real reference "
+             "(band-stds per climb/cruise/descent, aliased line family, ground silence).",
+    )
+    vibverify_parser.add_argument("input_bag", help="Bag to verify (.mcap file or directory)")
+    vibverify_parser.add_argument("--targets", default=None, metavar="JSON",
+                                  help="Phase-resolved targets JSON (measure_vib_targets_v2 schema)")
+    vibverify_parser.add_argument("--ref", default=None, metavar="BAG",
+                                  help="Derive targets from this reference bag instead")
+    vibverify_parser.add_argument("--save-targets", default=None, metavar="FILE",
+                                  help="With --ref: also save the derived targets JSON to FILE")
+    vibverify_parser.add_argument("--set-targets", default=None, metavar="JSON",
+                                  help="Save JSON as the default targets and use it for this run")
+    vibverify_parser.add_argument("--imu-topic", default="/imu/data_raw",
+                                  help="IMU topic (default: /imu/data_raw)")
+    vibverify_parser.add_argument("--gt-topic", default="/pf_geo_loc/fc_local_position",
+                                  help="Ground-truth pose topic for phase classification")
+
     # ---- filter-imu subcommand ----
     filterimu_parser = subparsers.add_parser(
         "filter-imu",
@@ -376,6 +398,28 @@ def main() -> None:
             print(f"Reference : {args.ref}")
         print()
         run_vib_check(args)
+
+    elif args.command == "vib-verify":
+        import json as _json, tempfile as _tempfile
+        if args.set_targets:
+            set_vib_targets(args.set_targets)
+            print(f"Saved default vib targets: {args.set_targets}")
+            args.targets = args.set_targets
+        if args.ref and not args.targets:
+            print(f"Deriving targets from reference: {args.ref} ...")
+            tgt = vib_measure_targets(args.ref, args.imu_topic, args.gt_topic)
+            out = args.save_targets or _tempfile.mktemp(suffix="_vib_targets.json")
+            with open(out, "w") as fh:
+                _json.dump(tgt, fh)
+            print(f"Targets written: {out}")
+            args.targets = out
+        if not args.targets:
+            args.targets = get_vib_targets()
+        if not args.targets:
+            print("ERROR: no targets. Use --targets JSON, --ref BAG, or --set-targets JSON.")
+            raise SystemExit(1)
+        print()
+        run_vib_verify(args)
 
     elif args.command == "filter-imu":
         stores = detect_stores_enum()
