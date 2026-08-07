@@ -618,13 +618,37 @@ def write_alignment_topics(
         conn_jump_penalty  = _computed_conn('/ov_srvins/eval_jump_penalty',   'std_msgs/msg/Float64')
         conn_avg_slam      = _computed_conn('/ov_srvins/eval_avg_slam_feats', 'std_msgs/msg/Float64')
 
-        # Landing detection: rightmost RTK fix at or below 0.5 m ENU Z (height above takeoff).
+        # Landing detection: TOUCHDOWN = start of the trailing GT segment whose
+        # ENU Z stays within LANDING_ALT of the FINAL fix, provided a descent
+        # precedes it. Referencing the final Z (not absolute 0) handles landing
+        # terrain offset from the takeoff datum; taking the segment START (not
+        # the rightmost below-threshold fix) excludes post-touchdown ground
+        # rest on bags that keep recording after landing — the old rule kept
+        # that rest in the metrics, and on offset terrain could latch onto the
+        # PRE-takeoff ground and silently drop the entire flight.
         LANDING_ALT = 0.5  # metres
         landing_stamp_ns = None
-        for _, stamp_ns, pos, _ in reversed(out_poses):
-            if pos[2] <= LANDING_ALT:
-                landing_stamp_ns = stamp_ns
-                break
+        if out_poses:
+            z_end = out_poses[-1][2][2]
+            run_start = None
+            for _, stamp_ns, pos, _ in reversed(out_poses):
+                if abs(pos[2] - z_end) <= LANDING_ALT:
+                    run_start = stamp_ns
+                else:
+                    break
+            if run_start is not None:
+                # Descent guard: ~10 s before touchdown the vehicle must have
+                # been well above the landing band, else the bag ends mid-air
+                # (e.g. truncated recording) and nothing should be cut. The
+                # immediately-preceding fix is useless here — a smooth final
+                # descent sits just above the band by construction.
+                z_before = None
+                for _, stamp_ns, pos, _ in reversed(out_poses):
+                    if stamp_ns <= run_start - 10_000_000_000:
+                        z_before = pos[2]
+                        break
+                if z_before is not None and z_before > z_end + 2.0:
+                    landing_stamp_ns = run_start
         if landing_stamp_ns is not None:
             n_before = len(posimus)
             posimus       = [(ts, pm) for ts, pm in posimus
