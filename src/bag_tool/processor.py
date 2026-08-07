@@ -106,10 +106,13 @@ def rte_values_from_ate(
     rte_window_ns: int,
 ) -> list[float]:
     """Compute per-frame RTE from ATE records. RTE = ATE(t) - ATE(t - window)."""
+    # Records may be 3-tuples (ts, stamp, ate) or 4-tuples with a trailing
+    # error VECTOR (eval mode; used for segment-anchored phase ATE).
     ate_header_stamps = [r[1] for r in ate_records]
     n_ate = len(ate_records)
     rte_values: list[float] = []
-    for _, vio_stamp_ns, ate in ate_records:
+    for rec in ate_records:
+        vio_stamp_ns, ate = rec[1], rec[2]
         past_stamp = vio_stamp_ns - rte_window_ns
         j = bisect.bisect_left(ate_header_stamps, past_stamp)
         if j >= n_ate:
@@ -225,6 +228,8 @@ COMPUTED_TOPICS = frozenset({
     '/ov_srvins/eval_ascent_rte',
     '/ov_srvins/eval_descent_ate',
     '/ov_srvins/eval_descent_rte',
+    '/ov_srvins/eval_cruise_ate',
+    '/ov_srvins/eval_cruise_rte',
 })
 
 # NED→ENU is a proper rotation (det = +1, equivalent to 180° about the (1,1,0)/√2 axis).
@@ -757,10 +762,10 @@ def write_alignment_topics(
                 if idx == 0:    return 0
                 if idx >= n_al: return n_al - 1
                 return idx if (al_stamps[idx] - vio_stamp_ns) <= (vio_stamp_ns - al_stamps[idx - 1]) else idx - 1
-            ate_records: list[tuple[int, int, float]] = []
+            ate_records: list[tuple] = []
             for vio_ts, vio_stamp_ns, vio_pos, _ in vio_frames:
-                ate = float(np.linalg.norm(vio_pos - al_positions[_nearest_al_eval(vio_stamp_ns)]))
-                ate_records.append((vio_ts, vio_stamp_ns, ate))
+                err = vio_pos - al_positions[_nearest_al_eval(vio_stamp_ns)]
+                ate_records.append((vio_ts, vio_stamp_ns, float(np.linalg.norm(err)), err))
 
             # VIO-failure extension: if VIO stopped before landing, freeze last position.
             n_frozen = 0
@@ -772,8 +777,8 @@ def write_alignment_topics(
                     for fix_ts, stamp_ns, _, _ in out_aligned:
                         if stamp_ns <= last_vio_stamp_ns:
                             continue
-                        ate = float(np.linalg.norm(frozen_pos - al_positions[_nearest_al_eval(stamp_ns)]))
-                        ate_records.append((fix_ts, stamp_ns, ate))
+                        err = frozen_pos - al_positions[_nearest_al_eval(stamp_ns)]
+                        ate_records.append((fix_ts, stamp_ns, float(np.linalg.norm(err)), err))
                         writer.write(conn_vio_pose, fix_ts + ts_offset, typestore.serialize_cdr(
                             make_pose_msg(stamp_ns, FRAME_ID, frozen_pos, frozen_rot), POSE_TYPE))
                         n_frozen += 1
@@ -781,7 +786,8 @@ def write_alignment_topics(
                         print(f'VIO failure detected — {n_frozen} frozen frames appended to landing')
 
             rte_values = rte_values_from_ate(ate_records, rte_window_ns)
-            for (vio_ts, _, _), rte in zip(ate_records, rte_values):
+            for rec, rte in zip(ate_records, rte_values):
+                vio_ts = rec[0]
                 writer.write(conn_rte, vio_ts + ts_offset, _ENCAP + struct.pack('<d', rte))
             rms_rte, jump_penalty = rms_jump_penalty(rte_values)
             first_ts = ate_records[0][0]
@@ -790,36 +796,58 @@ def write_alignment_topics(
             print(f'RMS RTE      : {rms_rte:.4f} m')
             print(f'Jump penalty : {jump_penalty:.4f} m  (threshold={JUMP_THRESHOLD}m)')
 
-            # Phase-specific metrics: ATE/RTE restricted to detected vertical
-            # (ascent/descent) segments. Runs on the TRUNCATED pose stream, so
-            # descent inherits the pre-touchdown cutoff above. Self-activates
-            # only when segments are found.
+            # Phase-specific metrics: ATE/RTE per flight phase. Vertical
+            # (ascent/descent) segments are detected from GT; CRUISE is their
+            # complement over the record range, so the partition covers the
+            # whole (touchdown-truncated) flight and divergence is localized
+            # to exactly one phase. Phase ATE is SEGMENT-ANCHORED: each
+            # segment is re-aligned at its first frame (the error vector at
+            # segment start is subtracted), so a phase measures only drift
+            # accrued WITHIN it — error inherited from earlier flight cancels.
+            # RTE is the same per-frame series as the global metric, subset.
             seg_fixes = [(sn, np.asarray(p, dtype=float)) for _, sn, p, _ in out_aligned]
             segments = detect_vertical_segments(seg_fixes)
             phase_metrics: dict = {}
-            for direction in ('ascent', 'descent'):
-                segs = [(a, b) for d_, a, b in segments if d_ == direction]
-                if not segs:
+            vert_iv = sorted((a, b) for _, a, b in segments)
+            cruise_iv = []
+            if ate_records:
+                lo, hi = ate_records[0][1], ate_records[-1][1]
+                cur = lo
+                for a, b in vert_iv:
+                    if a > cur:
+                        cruise_iv.append((cur, a - 1))
+                    cur = max(cur, b + 1)
+                if cur < hi:
+                    cruise_iv.append((cur, hi))
+            phases = [('ascent', [(a, b) for d_, a, b in segments if d_ == 'ascent']),
+                      ('descent', [(a, b) for d_, a, b in segments if d_ == 'descent']),
+                      ('cruise', cruise_iv)]
+            for name, ivs in phases:
+                vals_ate = []; vals_rte = []
+                for a, b in ivs:
+                    idx = [k for k, rec in enumerate(ate_records) if a <= rec[1] <= b]
+                    if not idx:
+                        continue
+                    ref = ate_records[idx[0]][3]        # error vector at segment start
+                    vals_ate += [float(np.linalg.norm(ate_records[k][3] - ref)) for k in idx]
+                    vals_rte += [rte_values[k] for k in idx]
+                if not vals_ate:
                     continue
-                sel = [k for k, (_, sn, _) in enumerate(ate_records)
-                       if any(a <= sn <= b for a, b in segs)]
-                if not sel:
-                    continue
-                p_ate = float(np.sqrt(np.mean([ate_records[k][2] ** 2 for k in sel])))
-                p_rte = float(np.sqrt(np.mean([rte_values[k] ** 2 for k in sel])))
-                phase_metrics[f'{direction}_ate'] = p_ate
-                phase_metrics[f'{direction}_rte'] = p_rte
-                phase_metrics[f'{direction}_segments'] = len(segs)
-                dur = sum((b - a) for a, b in segs) / 1e9
-                print(f'{direction.capitalize():7s} ({len(segs)} seg, {dur:.0f}s): '
-                      f'ATE {p_ate:.3f} m  RTE {p_rte:.4f} m')
+                p_ate = float(np.sqrt(np.mean(np.square(vals_ate))))
+                p_rte = float(np.sqrt(np.mean(np.square(vals_rte))))
+                phase_metrics[f'{name}_ate'] = p_ate
+                phase_metrics[f'{name}_rte'] = p_rte
+                phase_metrics[f'{name}_segments'] = len(ivs)
+                dur = sum((b - a) for a, b in ivs) / 1e9
+                print(f'{name.capitalize():7s} ({len(ivs)} seg, {dur:.0f}s): '
+                      f'ATE {p_ate:.3f} m  RTE {p_rte:.4f} m   (segment-anchored)')
                 first_ts = ate_records[0][0]
-                for key, val in ((f'/ov_srvins/eval_{direction}_ate', p_ate),
-                                 (f'/ov_srvins/eval_{direction}_rte', p_rte)):
+                for key, val in ((f'/ov_srvins/eval_{name}_ate', p_ate),
+                                 (f'/ov_srvins/eval_{name}_rte', p_rte)):
                     conn = _computed_conn(key, 'std_msgs/msg/Float64')
                     writer.write(conn, first_ts + ts_offset, _ENCAP + struct.pack('<d', val))
             if not segments:
-                print('No ascent/descent segments detected — phase metrics skipped')
+                print('No ascent/descent segments detected — cruise = whole flight')
             if diag_tracking:
                 avg_slam_feats = float(np.mean([c for _, c in diag_tracking]))
                 writer.write(conn_avg_slam, first_ts + ts_offset, _ENCAP + struct.pack('<d', avg_slam_feats))
