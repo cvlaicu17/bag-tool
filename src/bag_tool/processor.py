@@ -120,6 +120,80 @@ def rte_values_from_ate(
     return rte_values
 
 
+# --- Ascent/descent segment detection (phase-specific ATE/RTE) -------------
+# A segment is a maximal run of GT fixes that never violates the vertical
+# profile: horizontal speed < SEG_VH_MAX. Within the run, fixes are
+# "vertical" when |vz| > SEG_VZ_MIN; hover fixes (low xy AND low z) do NOT
+# break the run — a pause mid-climb or the hover between descent stages is
+# still part of the segment. A run qualifies only if its accumulated
+# VERTICAL time exceeds SEG_MIN_VERT_S (pure hover never qualifies: it is
+# only ever absorbed into a run seeded by vertical motion). Direction is the
+# sign of the net z displacement. Multiple segments per flight are expected
+# (takeoff ascent, staged landing descent). Velocities are finite
+# differences over a ~1 s stamp baseline, robust to 5-100 Hz GT rates.
+SEG_VH_MAX = 1.0       # m/s horizontal — above this the vertical profile is violated
+SEG_VZ_MIN = 0.8       # m/s — |vz| above this counts as vertical motion
+SEG_MIN_VERT_S = 5.0   # s of accumulated vertical motion to qualify
+SEG_MIN_NET_DZ = 3.0   # m net |dz| sanity floor
+
+
+def detect_vertical_segments(fixes):
+    """fixes: [(stamp_ns, pos ENU)] time-ordered. Returns
+    [(dir, start_ns, end_ns)] with dir in {'ascent', 'descent'}."""
+    n = len(fixes)
+    if n < 3:
+        return []
+    stamps = [s for s, _ in fixes]
+
+    def vel(i):
+        t = stamps[i]
+        j = i
+        while j > 0 and t - stamps[j - 1] < 500_000_000:
+            j -= 1
+        k = i
+        while k < n - 1 and stamps[k + 1] - t < 500_000_000:
+            k += 1
+        dt = (stamps[k] - stamps[j]) / 1e9
+        if dt <= 1e-6:
+            return 0.0, 0.0
+        dp = fixes[k][1] - fixes[j][1]
+        return float(np.hypot(dp[0], dp[1]) / dt), float(dp[2] / dt)
+
+    segments = []
+    cur_start = None
+    vert_time = 0.0
+    prev_stamp = None
+    for i in range(n):
+        vh, vz = vel(i)
+        if vh < SEG_VH_MAX:
+            if cur_start is None:
+                if abs(vz) > SEG_VZ_MIN:
+                    cur_start = stamps[i]
+                    vert_time = 0.0
+                    prev_stamp = stamps[i]
+            else:
+                if abs(vz) > SEG_VZ_MIN and prev_stamp is not None:
+                    vert_time += (stamps[i] - prev_stamp) / 1e9
+                prev_stamp = stamps[i]
+        else:
+            if cur_start is not None:
+                segments.append((cur_start, stamps[i - 1] if i else cur_start, vert_time))
+                cur_start = None
+    if cur_start is not None:
+        segments.append((cur_start, stamps[-1], vert_time))
+
+    out = []
+    z_at = {s: p[2] for s, p in fixes}
+    for start, end, vt in segments:
+        if vt < SEG_MIN_VERT_S:
+            continue
+        dz = z_at[end] - z_at[start]
+        if abs(dz) < SEG_MIN_NET_DZ:
+            continue
+        out.append(('ascent' if dz > 0 else 'descent', start, end))
+    return out
+
+
 def rms_jump_penalty(rte_values: list[float]) -> tuple[float, float]:
     """Return (rms_rte, jump_penalty) from a list of per-frame RTE values."""
     rte_arr = np.array(rte_values)
@@ -147,6 +221,10 @@ COMPUTED_TOPICS = frozenset({
     '/ov_srvins/eval_rms_rte',
     '/ov_srvins/eval_jump_penalty',
     '/ov_srvins/eval_avg_slam_feats',
+    '/ov_srvins/eval_ascent_ate',
+    '/ov_srvins/eval_ascent_rte',
+    '/ov_srvins/eval_descent_ate',
+    '/ov_srvins/eval_descent_rte',
 })
 
 # NED→ENU is a proper rotation (det = +1, equivalent to 180° about the (1,1,0)/√2 axis).
@@ -711,6 +789,37 @@ def write_alignment_topics(
             writer.write(conn_jump_penalty, first_ts + ts_offset, _ENCAP + struct.pack('<d', jump_penalty))
             print(f'RMS RTE      : {rms_rte:.4f} m')
             print(f'Jump penalty : {jump_penalty:.4f} m  (threshold={JUMP_THRESHOLD}m)')
+
+            # Phase-specific metrics: ATE/RTE restricted to detected vertical
+            # (ascent/descent) segments. Runs on the TRUNCATED pose stream, so
+            # descent inherits the pre-touchdown cutoff above. Self-activates
+            # only when segments are found.
+            seg_fixes = [(sn, np.asarray(p, dtype=float)) for _, sn, p, _ in out_aligned]
+            segments = detect_vertical_segments(seg_fixes)
+            phase_metrics: dict = {}
+            for direction in ('ascent', 'descent'):
+                segs = [(a, b) for d_, a, b in segments if d_ == direction]
+                if not segs:
+                    continue
+                sel = [k for k, (_, sn, _) in enumerate(ate_records)
+                       if any(a <= sn <= b for a, b in segs)]
+                if not sel:
+                    continue
+                p_ate = float(np.sqrt(np.mean([ate_records[k][2] ** 2 for k in sel])))
+                p_rte = float(np.sqrt(np.mean([rte_values[k] ** 2 for k in sel])))
+                phase_metrics[f'{direction}_ate'] = p_ate
+                phase_metrics[f'{direction}_rte'] = p_rte
+                phase_metrics[f'{direction}_segments'] = len(segs)
+                dur = sum((b - a) for a, b in segs) / 1e9
+                print(f'{direction.capitalize():7s} ({len(segs)} seg, {dur:.0f}s): '
+                      f'ATE {p_ate:.3f} m  RTE {p_rte:.4f} m')
+                first_ts = ate_records[0][0]
+                for key, val in ((f'/ov_srvins/eval_{direction}_ate', p_ate),
+                                 (f'/ov_srvins/eval_{direction}_rte', p_rte)):
+                    conn = _computed_conn(key, 'std_msgs/msg/Float64')
+                    writer.write(conn, first_ts + ts_offset, _ENCAP + struct.pack('<d', val))
+            if not segments:
+                print('No ascent/descent segments detected — phase metrics skipped')
             if diag_tracking:
                 avg_slam_feats = float(np.mean([c for _, c in diag_tracking]))
                 writer.write(conn_avg_slam, first_ts + ts_offset, _ENCAP + struct.pack('<d', avg_slam_feats))
@@ -718,7 +827,8 @@ def write_alignment_topics(
             else:
                 avg_slam_feats = None
                 print('WARNING: diag/tracking not in bag — avg_slam_feats skipped')
-            metrics: dict = {'rms_rte': rms_rte, 'jump_penalty': jump_penalty}
+            metrics: dict = {'rms_rte': rms_rte, 'jump_penalty': jump_penalty,
+                             **phase_metrics}
             if avg_slam_feats is not None:
                 metrics['avg_slam_feats'] = avg_slam_feats
             return metrics
