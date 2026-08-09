@@ -252,25 +252,52 @@ def run(result_bag: str, src_bag: str, platform: str = 'alexios',
     rel = err / np.maximum(np.abs(R[:, 4]), 1e-6)
     phases = np.array([phase_of(int(x)) for x in tns], dtype=object)
 
+    fids = R[:, 1].astype(np.int64)
     out = {}
     print(f'\n[feat-depth] {len(R)} joined (feature,frame) samples')
-    print(f'{"type":<7s} {"phase":<8s} {"n":>8s} {"gt_dep p50":>11s} '
-          f'{"err p50":>9s} {"|err| p50":>10s} {"|err| p90":>10s} {"rel p50":>9s}')
+    print(f'{"type":<6s} {"phase":<8s} {"n":>8s} {"tracks":>7s} {"gt_dep":>7s} '
+          f'{"BIAS":>8s} {"trk_scat":>9s} {"NOISE":>7s} {"rel_bias":>9s} '
+          f'{"rel_scat":>9s} {"out>1m":>7s} {"out>5%":>7s}')
     for tg, nm in ((0, 'MSCKF'), (1, 'SLAM')):
         for ph in ('ascent', 'descent', 'cruise'):
             msk = (tag == tg) & (phases == ph)
             if msk.sum() < 30:
                 continue
-            st = dict(n=int(msk.sum()),
-                      gt_dep_p50=float(np.median(R[msk, 4])),
-                      err_p50=float(np.median(err[msk])),
-                      abs_p50=float(np.median(np.abs(err[msk]))),
-                      abs_p90=float(np.percentile(np.abs(err[msk]), 90)),
-                      rel_p50=float(np.median(np.abs(rel[msk]))))
+            e = err[msk]
+            g = R[msk, 4]
+            f_ = fids[msk]
+            # Per-track decomposition: a landmark's error persists across
+            # frames, so the pooled std conflates two diseases. Split into
+            #   BIAS      = mean of per-track mean errors (systematic)
+            #   trk_scat  = std of per-track mean errors (landmark-to-landmark)
+            #   NOISE     = std of within-track residuals (frame-to-frame)
+            order = np.argsort(f_, kind='stable')
+            fs, es, gs = f_[order], e[order], g[order]
+            first = np.ones(len(fs), bool)
+            first[1:] = fs[1:] != fs[:-1]
+            gidx = np.cumsum(first) - 1
+            cnt = np.bincount(gidx)
+            tmean = np.bincount(gidx, weights=es) / cnt
+            tgt = np.bincount(gidx, weights=gs) / cnt
+            resid = es - tmean[gidx]
+            multi = cnt[gidx] > 1
+            st = dict(
+                n=int(msk.sum()), tracks=int(len(tmean)),
+                gt_dep_p50=float(np.median(g)),
+                bias=float(np.mean(tmean)),
+                bias_med=float(np.median(tmean)),
+                trk_scatter=float(np.std(tmean)),
+                noise=float(np.std(resid[multi])) if multi.any() else 0.0,
+                rel_bias=float(np.mean(tmean / np.maximum(np.abs(tgt), 1e-6))),
+                rel_scatter=float(np.std(tmean / np.maximum(np.abs(tgt), 1e-6))),
+                out_1m=float(np.mean(np.abs(e) > 1.0)),
+                out_5pct=float(np.mean(np.abs(e) > 0.05 * np.abs(g))))
             out[(nm, ph)] = st
-            print(f'{nm:<7s} {ph:<8s} {st["n"]:8d} {st["gt_dep_p50"]:11.1f} '
-                  f'{st["err_p50"]:+9.2f} {st["abs_p50"]:10.2f} '
-                  f'{st["abs_p90"]:10.2f} {st["rel_p50"]:9.3f}')
+            print(f'{nm:<6s} {ph:<8s} {st["n"]:8d} {st["tracks"]:7d} '
+                  f'{st["gt_dep_p50"]:7.1f} {st["bias"]:+8.2f} '
+                  f'{st["trk_scatter"]:9.2f} {st["noise"]:7.2f} '
+                  f'{st["rel_bias"]:+9.3f} {st["rel_scatter"]:9.3f} '
+                  f'{100*st["out_1m"]:6.1f}% {100*st["out_5pct"]:6.1f}%')
     if dump_npz:
         np.savez_compressed(dump_npz, rows=R, phases=phases)
         print(f'[feat-depth] raw join -> {dump_npz}')
