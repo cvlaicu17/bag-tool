@@ -147,6 +147,38 @@ def main() -> None:
              "(default: ''; use to avoid clobbering prior runs when sweeping --yaw-rot).",
     )
 
+    # ---- graft subcommand ----
+    gr_parser = subparsers.add_parser(
+        "graft",
+        help="Generate drift-free (GT) feature-injection arms from an "
+             "offline-tracked feature bag (GRAFT experiment).",
+    )
+    gr_parser.add_argument("feat_bag", help="run_offline_klt output bag")
+    gr_parser.add_argument("src_bag", help="Source mission bag (depth channel)")
+    gr_parser.add_argument("out_prefix", help="Output prefix; writes "
+                                              "<prefix>_realm and <prefix>_gt")
+    gr_parser.add_argument("--platform", default="alexios")
+    gr_parser.add_argument("--noise-px", type=float, default=0.0,
+                           help="iid pixel noise on the GT arm (default 0; "
+                                "0.5 px iid is known to collapse descent)")
+
+    # ---- feat-depth subcommand ----
+    fd_parser = subparsers.add_parser(
+        "feat-depth",
+        help="Per-feature depth GT for the estimator's landmarks "
+             "(joins feat3d_slam/feat3d_msckf against depth-image ground truth).",
+    )
+    fd_parser.add_argument("result_bag", help="Serial-runner output bag (with feat3d topics)")
+    fd_parser.add_argument("src_bag", help="Source mission bag (depth channel; "
+                                           "/features/tracks fallback for injected runs)")
+    fd_parser.add_argument("--platform", default="alexios",
+                           help="Camera extrinsic/intrinsic set (default: alexios)")
+    fd_parser.add_argument("--dump-npz", default=None,
+                           help="Optional path for the raw per-observation join")
+    fd_parser.add_argument("--tracks-bag", default=None,
+                           help="Bag carrying /features/tracks for injected runs "
+                                "(default: src_bag)")
+
     # ---- eval subcommand ----
     eval_parser = subparsers.add_parser(
         "eval",
@@ -374,6 +406,20 @@ def main() -> None:
                   rte_window=args.rte_window, eval_mode=args.eval, manual=args.manual,
                   shrink=args.shrink, platform=platform, yaw_rot=args.yaw_rot,
                   out_suffix=args.out_suffix)
+
+    elif args.command == "graft":
+
+        from bag_tool.graft import run as run_graft
+
+        run_graft(args.feat_bag, args.src_bag, args.out_prefix,
+                  platform=args.platform, noise_px=args.noise_px)
+
+    elif args.command == "feat-depth":
+
+        from bag_tool.feat_depth import run as run_feat_depth
+
+        run_feat_depth(args.result_bag, args.src_bag, platform=args.platform,
+                       dump_npz=args.dump_npz, tracks_bag=args.tracks_bag)
 
     elif args.command == "eval":
         stores = detect_stores_enum()
