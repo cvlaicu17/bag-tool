@@ -16,6 +16,7 @@ from bag_tool.add_topics import run as run_add_topics
 from bag_tool.add_paths import run as run_add_paths
 from bag_tool.align import run as run_align
 from bag_tool.eval import run as run_eval
+from bag_tool.scale_eval import run as run_scale_eval
 from bag_tool.vio_check import run as run_vio_check
 from bag_tool.filter_imu import run as run_filter_imu
 from bag_tool.vib_check import run as run_vib_check
@@ -115,6 +116,12 @@ def main() -> None:
         help="Write only RTK aligned poses and srvins poses (no paths, no ATE/RTE).",
     )
     align_parser.add_argument(
+        "--scale",
+        action="store_true",
+        help=("After aligning, split the error into SCALE vs SHAPE (rigid SE3 vs "
+              "scaled Sim3 alignment), globally and per window."),
+    )
+    align_parser.add_argument(
         "--rte-window",
         type=float, default=1.0, metavar="SECONDS",
         help="Window size in seconds for relative trajectory error (default: 1.0).",
@@ -189,6 +196,13 @@ def main() -> None:
         "--rte-window",
         type=float, default=1.0, metavar="SECONDS",
         help="Window size in seconds for relative trajectory error (default: 1.0).",
+    )
+    eval_parser.add_argument(
+        "--scale",
+        action="store_true",
+        help=("Also split the error into SCALE vs SHAPE by aligning ground truth "
+              "twice (rigid SE3 and scaled Sim3), globally and per window. "
+              "Reprojection-based health metrics are blind to the scale part."),
     )
 
     # ---- add-topics subcommand ----
@@ -406,6 +420,12 @@ def main() -> None:
                   rte_window=args.rte_window, eval_mode=args.eval, manual=args.manual,
                   shrink=args.shrink, platform=platform, yaw_rot=args.yaw_rot,
                   out_suffix=args.out_suffix)
+        if getattr(args, "scale", False):
+            from pathlib import Path as _P
+            out = args.out_suffix or "_aligned"
+            aligned = str(_P(args.input_bag).with_suffix("")) + out
+            print()
+            run_scale_eval(aligned, stores)
 
     elif args.command == "graft":
 
@@ -425,6 +445,9 @@ def main() -> None:
         stores = detect_stores_enum()
         print()
         run_eval(args.aligned_bag, stores, rte_window_ns=int(args.rte_window * 1e9))
+        if args.scale:
+            print()
+            run_scale_eval(args.aligned_bag, stores)
 
     elif args.command == "add-topics":
         print()
