@@ -160,6 +160,36 @@ def run(input_bag: str, stores_enum, windows_s=(4.0, 10.0)) -> dict:
 
     out = {'global': {'rms_rigid': rms_rigid, 'rms_shape': rms_sim3, 'scale': s_glob}}
 
+    # ---- per-phase, WHOLE SEGMENT as a single alignment -------------------
+    # Sits between GLOBAL (one fit over the whole mission) and WINDOWED (one fit
+    # per 4-10s slice): here each flight phase (e.g. the whole cruise segment,
+    # commonly several minutes) gets exactly ONE rigid vs Sim3 fit. This answers
+    # "how much of THIS PHASE's error does a single scale correction explain",
+    # without the windowed view's within-phase averaging, and without the global
+    # fit's cross-phase mixing (a cruise-only scale error can be diluted by
+    # ascent/descent in the global number).
+    print()
+    print('PER-PHASE (entire phase as one window)')
+    print(f'  {"phase":9s} {"n":>5s} | {"rigid rms":>10s} {"rigid max":>10s} | '
+          f'{"shape rms":>10s} {"shape max":>10s} | {"scale s":>10s} | shape/total')
+    out['per_phase'] = {}
+    for ph in ('ascent', 'cruise', 'descent'):
+        sel = phase_of == ph
+        if sel.sum() < 8:
+            continue
+        g, v = gt_p[sel], vio_p[sel]
+        r_rig, m_rig, _ = _err(g, v, False)
+        r_shp, m_shp, s_ph = _err(g, v, True)
+        ratio = r_shp / r_rig if r_rig > 1e-9 else float('nan')
+        dur = t[sel].max() - t[sel].min()
+        print(f'  {ph:9s} {sel.sum():5d} | {r_rig:10.3f} {m_rig:10.3f} | '
+              f'{r_shp:10.3f} {m_shp:10.3f} | {s_ph:7.4f} ({100*(s_ph-1):+.2f}%) | {ratio:6.3f}'
+              f'   ({dur:.0f}s)')
+        out['per_phase'][ph] = {'n': int(sel.sum()), 'duration_s': float(dur),
+                                 'rigid_rms': r_rig, 'rigid_max': m_rig,
+                                 'shape_rms': r_shp, 'shape_max': m_shp,
+                                 'scale': s_ph, 'shape_over_total': float(ratio)}
+
     # ---- windowed --------------------------------------------------------
     for win in windows_s:
         rows = []
