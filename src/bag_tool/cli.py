@@ -70,6 +70,12 @@ def main() -> None:
         help="Only write per-message pose topics (skip paths and ATE/RTE).",
     )
     convert_parser.add_argument(
+        "--vio-topic", default=None, metavar="TOPIC",
+        help="Use TOPIC as the VIO topic for this run only, without prompting and "
+             "without changing the stored default. Needed to score estimators other "
+             "than eagle-vision (e.g. VINS-Fusion publishes /vins_estimator/odometry).",
+    )
+    convert_parser.add_argument(
         "--eval",
         action="store_true",
         help="Write only RTK aligned poses and srvins poses (no paths, no ATE/RTE).",
@@ -104,6 +110,12 @@ def main() -> None:
         "-n", "--new-topic",
         action="store_true",
         help="Always prompt for the VIO topic, ignoring the stored default.",
+    )
+    align_parser.add_argument(
+        "--vio-topic", default=None, metavar="TOPIC",
+        help="Use TOPIC as the VIO topic for this run only, without prompting and "
+             "without changing the stored default. Needed to score estimators other "
+             "than eagle-vision (e.g. VINS-Fusion publishes /vins_estimator/odometry).",
     )
     align_parser.add_argument(
         "-q", "--quick",
@@ -367,7 +379,11 @@ def main() -> None:
         print()
 
         stored = get_vio_topic()
-        if args.new_topic or stored is None:
+        if getattr(args, "vio_topic", None):
+            # Explicit override: one-shot, never persisted, so the stored
+            # eagle-vision default survives for the next run.
+            vio_topic = args.vio_topic
+        elif args.new_topic or stored is None:
             vio_topic = _ask_vio_topic(stored or _DEFAULT_VIO_TOPIC)
             set_vio_topic(vio_topic)
         else:
@@ -397,7 +413,11 @@ def main() -> None:
         print()
 
         stored = get_vio_topic()
-        if args.new_topic or stored is None:
+        if getattr(args, "vio_topic", None):
+            # Explicit override: one-shot, never persisted, so the stored
+            # eagle-vision default survives for the next run.
+            vio_topic = args.vio_topic
+        elif args.new_topic or stored is None:
             vio_topic = _ask_vio_topic(stored or _DEFAULT_VIO_TOPIC)
             set_vio_topic(vio_topic)
         else:
