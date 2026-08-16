@@ -139,6 +139,16 @@ SEG_VZ_MIN = 0.8       # m/s — |vz| above this counts as vertical motion
 SEG_MIN_VERT_S = 5.0   # s of accumulated vertical motion to qualify
 SEG_MIN_NET_DZ = 3.0   # m net |dz| sanity floor
 
+# --- INIT phase: ground -> INIT_TOP_M of the first ascent ------------------
+# Rationale (user, 2026-08-15): "even tiny problems at init can destroy the
+# future trajectory" -- so measure the init directly instead of inferring it
+# from whole-flight numbers. This window is the estimator's bootstrap: the
+# climb from the launch pad to INIT_TOP_M, where scale is acquired and where
+# a visual-inertial initializer either earns its metric footing or bakes in
+# an error the rest of the flight inherits. Reported ALONGSIDE (not instead
+# of) the ascent phase, and segment-anchored the same way.
+INIT_TOP_M = 6.0
+
 
 def detect_vertical_segments(fixes):
     """fixes: [(stamp_ns, pos ENU)] time-ordered. Returns
@@ -230,6 +240,8 @@ COMPUTED_TOPICS = frozenset({
     '/ov_srvins/eval_descent_rte',
     '/ov_srvins/eval_cruise_ate',
     '/ov_srvins/eval_cruise_rte',
+    '/ov_srvins/eval_init_ate',
+    '/ov_srvins/eval_init_rte',
 })
 
 # NED→ENU is a proper rotation (det = +1, equivalent to 180° about the (1,1,0)/√2 axis).
@@ -819,7 +831,30 @@ def write_alignment_topics(
                     cur = max(cur, b + 1)
                 if cur < hi:
                     cruise_iv.append((cur, hi))
-            phases = [('ascent', [(a, b) for d_, a, b in segments if d_ == 'ascent']),
+            # INIT window: from the first ascent segment's start until GT
+            # altitude first exceeds INIT_TOP_M above the launch height.
+            init_iv = []
+            asc = sorted((a, b) for d_, a, b in segments if d_ == 'ascent')
+            if asc:
+                a0, b0 = asc[0]
+                z_by_stamp = {sn: float(p[2]) for _, sn, p, _ in out_aligned}
+                base_z = None
+                top_stamp = None
+                for sn in sorted(z_by_stamp):
+                    if sn < a0:
+                        continue
+                    if base_z is None:
+                        base_z = z_by_stamp[sn]
+                    if z_by_stamp[sn] - base_z >= INIT_TOP_M:
+                        top_stamp = sn
+                        break
+                if top_stamp is not None:
+                    init_iv = [(a0, top_stamp)]
+                elif b0 > a0:
+                    init_iv = [(a0, b0)]   # never reached INIT_TOP_M: whole ascent
+
+            phases = [('init', init_iv),
+                      ('ascent', [(a, b) for d_, a, b in segments if d_ == 'ascent']),
                       ('descent', [(a, b) for d_, a, b in segments if d_ == 'descent']),
                       ('cruise', cruise_iv)]
             for name, ivs in phases:
