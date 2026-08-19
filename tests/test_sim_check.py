@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from bag_tool.sim_check import _grade
+from bag_tool.sim_check import _check_depth_association, _grade
 from bag_tool.vio_check import analyze_topic
 
 
@@ -32,6 +32,23 @@ def test_shared_vio_cadence_analysis_detects_gap_and_non_monotonic_timestamp():
     assert len(result["gaps"]) == 1
     assert result["non_monotonic_log"] == 1
     assert not result["pass"]
+
+
+def test_depth_association_accepts_extra_depth_frames():
+    passed, missing, extra = _check_depth_association(
+        [10, 20, 30], [0, 10, 20, 30, 40])
+
+    assert passed
+    assert missing == 0
+    assert extra == 2
+
+
+def test_depth_association_rejects_mono_without_depth():
+    passed, missing, extra = _check_depth_association([10, 20, 30], [10, 30])
+
+    assert not passed
+    assert missing == 1
+    assert extra == 0
 
 
 @pytest.mark.parametrize(

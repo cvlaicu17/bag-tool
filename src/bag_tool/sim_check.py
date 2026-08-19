@@ -8,6 +8,7 @@ reference embedded below.
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 
 import numpy as np
@@ -63,6 +64,21 @@ def _report_topic(expectation: TopicExpectation, captured: dict,
           f"nonmono={result.get('non_monotonic_log', 0)}/{result.get('non_monotonic_stamp', 0)} "
           f"(expected {expectation.rate_hz:g} Hz ±{100 * expectation.tolerance:g}%)")
     return result["pass"]
+
+
+def _check_depth_association(mono: list[int], depth: list[int]) -> tuple[bool, int, int]:
+    """Require every mono capture to have one depth capture at the same stamp.
+
+    The recorder can legitimately emit an initial or final depth-only frame.
+    Such extra depth frames are retained and reported, but never make a mission
+    fail.  Counters rather than sets preserve the intended one-depth-per-mono
+    relationship should a producer emit duplicate timestamps.
+    """
+    mono_counts = Counter(mono)
+    depth_counts = Counter(depth)
+    missing_mono = sum((mono_counts - depth_counts).values())
+    extra_depth = sum((depth_counts - mono_counts).values())
+    return bool(mono) and missing_mono == 0, missing_mono, extra_depth
 
 
 def _grade(value: float, reference: float, tiny: float) -> str:
@@ -148,9 +164,10 @@ def run(args) -> None:
 
     mono = recorded[args.camera_topic]["stamp_times"] or recorded[args.camera_topic]["log_times"]
     depth = recorded[args.depth_topic]["stamp_times"] or recorded[args.depth_topic]["log_times"]
-    paired = mono == depth and len(mono) > 0
-    print(f"  [{'PASS' if paired else 'FAIL'}] mono/depth timestamp pairing: "
-          f"{len(mono)} / {len(depth)} messages")
+    paired, mono_missing, depth_extra = _check_depth_association(mono, depth)
+    print(f"  [{'PASS' if paired else 'FAIL'}] mono/depth association: "
+          f"{len(mono)} mono, {len(depth)} depth; "
+          f"missing mono-depth={mono_missing}, extra depth={depth_extra}")
 
     print("Vibration (20–100 Hz and 100–195 Hz bands):")
     vibration_pass, warnings, failures = _vibration_check(
