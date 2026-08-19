@@ -21,6 +21,7 @@ from bag_tool.vio_check import run as run_vio_check
 from bag_tool.filter_imu import run as run_filter_imu
 from bag_tool.vib_check import run as run_vib_check
 from bag_tool.vib_verify import run as run_vib_verify, measure_targets as vib_measure_targets
+from bag_tool.sim_check import run as run_sim_check
 from bag_tool.platforms import PLATFORMS, detect_from_bag, detect_from_bags
 
 
@@ -308,6 +309,41 @@ def main() -> None:
     vibverify_parser.add_argument("--gt-topic", default="/pf_geo_loc/fc_local_position",
                                   help="Ground-truth pose topic for phase classification")
 
+    # ---- sim-check subcommand ----
+    simcheck_parser = subparsers.add_parser(
+        "sim-check",
+        help="Validate a Project AirSim bag's GT/camera cadence and IMU vibrations.",
+    )
+    simcheck_parser.add_argument("input_bag", help="PAS bag directory or .mcap file")
+    simcheck_parser.add_argument("--imu-topic", default="/imu/data_raw",
+                                 help="IMU topic (default: /imu/data_raw)")
+    simcheck_parser.add_argument("--gt-topic", default="/pf_geo_loc/fc_local_position",
+                                 help="Ground-truth pose topic (default: /pf_geo_loc/fc_local_position)")
+    simcheck_parser.add_argument("--camera-topic", default="/camera/image_mono",
+                                 help="Monochrome camera topic (default: /camera/image_mono)")
+    simcheck_parser.add_argument("--depth-topic", default="/camera/depth",
+                                 help="Depth camera topic (default: /camera/depth)")
+    simcheck_parser.add_argument("--range-topic", default="/altimeter/range",
+                                 help="Range topic (default: /altimeter/range)")
+    simcheck_parser.add_argument("--imu-hz", type=float, default=400.0,
+                                 help="Expected IMU rate (default: 400)")
+    simcheck_parser.add_argument("--gt-hz", type=float, default=400.0,
+                                 help="Expected GT pose rate (default: 400)")
+    simcheck_parser.add_argument("--camera-hz", type=float, default=20.0,
+                                 help="Expected mono/depth rate (default: 20)")
+    simcheck_parser.add_argument("--range-hz", type=float, default=12.6,
+                                 help="Expected range rate (default: 12.6)")
+    simcheck_parser.add_argument("--imu-tolerance", type=float, default=0.02,
+                                 help="Fractional IMU cadence tolerance (default: 0.02)")
+    simcheck_parser.add_argument("--gt-tolerance", type=float, default=0.02,
+                                 help="Fractional GT cadence tolerance (default: 0.02)")
+    simcheck_parser.add_argument("--camera-tolerance", type=float, default=0.10,
+                                 help="Fractional mono/depth cadence tolerance (default: 0.10)")
+    simcheck_parser.add_argument("--range-tolerance", type=float, default=0.20,
+                                 help="Fractional range cadence tolerance (default: 0.20)")
+    simcheck_parser.add_argument("--gap-mult", type=float, default=3.0,
+                                 help="Interval multiple considered a timestamp gap (default: 3)")
+
     # ---- filter-imu subcommand ----
     filterimu_parser = subparsers.add_parser(
         "filter-imu",
@@ -509,6 +545,10 @@ def main() -> None:
             raise SystemExit(1)
         print()
         run_vib_verify(args)
+
+    elif args.command == "sim-check":
+        print()
+        run_sim_check(args)
 
     elif args.command == "filter-imu":
         stores = detect_stores_enum()
