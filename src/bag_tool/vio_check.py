@@ -80,6 +80,7 @@ def stats(vals: list[float]) -> dict:
             "std":  float(np.std(a)),
             "min":  float(np.min(a)),
             "max":  float(np.max(a)),
+            "p50":  float(np.percentile(a, 50)),
             "p95":  float(np.percentile(a, 95)),
             "p99":  float(np.percentile(a, 99)),
         }
@@ -94,6 +95,7 @@ def stats(vals: list[float]) -> dict:
             "std":  var ** 0.5,
             "min":  srt[0],
             "max":  srt[-1],
+            "p50":  srt[int(0.50 * (n - 1))],
             "p95":  srt[int(0.95 * n)],
             "p99":  srt[int(0.99 * n)],
         }
@@ -111,7 +113,15 @@ def fmt_ns(ns: float) -> str:
 # ── Per-topic analysis ────────────────────────────────────────────────────────
 def analyze_topic(name: str, log_times: list[int], stamp_times: list[int],
                   expected_hz: float | None, gap_mult: float = 3.0,
-                  latency_outliers: bool = True) -> dict:
+                  latency_outliers: bool = True, rate_tolerance: float = 0.15,
+                  strict_gaps: bool = False) -> dict:
+    """Analyse one sensor cadence.
+
+    ``sim-check`` shares this implementation but requests its tighter PAS
+    rate tolerances and treats every timestamp gap as a failure.  The defaults
+    preserve the historical, more forgiving physical-sensor behaviour of
+    ``vio-check``.
+    """
     result = {"name": name, "issues": [], "pass": True}
     n = len(log_times)
     result["msg_count"] = n
@@ -145,9 +155,10 @@ def analyze_topic(name: str, log_times: list[int], stamp_times: list[int],
     result["mean_hz"] = mean_hz
 
     if expected_hz and expected_hz > 0:
-        if abs(mean_hz - expected_hz) / expected_hz > 0.15:
+        if abs(mean_hz - expected_hz) / expected_hz > rate_tolerance:
             result["issues"].append(
-                f"Mean freq {mean_hz:.1f} Hz deviates >15% from expected {expected_hz:.1f} Hz"
+                f"Mean freq {mean_hz:.1f} Hz deviates >{100 * rate_tolerance:g}% "
+                f"from expected {expected_hz:.1f} Hz"
             )
             result["pass"] = False
     else:
@@ -174,7 +185,7 @@ def analyze_topic(name: str, log_times: list[int], stamp_times: list[int],
             f"{len(gaps)} gap(s) > {gap_mult:.1f}× expected interval "
             f"(total lost: {total_gap_s:.2f} s)"
         )
-        if len(gaps) > 15 or total_gap_s > 2.0:
+        if strict_gaps or len(gaps) > 15 or total_gap_s > 2.0:
             result["pass"] = False
 
     # Dropped frames
@@ -221,9 +232,10 @@ def analyze_topic(name: str, log_times: list[int], stamp_times: list[int],
         result["stamp_interval"] = si
         stamp_hz = hz(si["mean"])
         result["stamp_mean_hz"] = stamp_hz
-        if abs(stamp_hz - expected_hz) / expected_hz > 0.15:
+        if abs(stamp_hz - expected_hz) / expected_hz > rate_tolerance:
             result["issues"].append(
-                f"Header stamp rate {stamp_hz:.1f} Hz deviates >15% from expected {expected_hz:.1f} Hz"
+                f"Header stamp rate {stamp_hz:.1f} Hz deviates >{100 * rate_tolerance:g}% "
+                f"from expected {expected_hz:.1f} Hz"
             )
             result["pass"] = False
         st_gap_thresh = gap_mult * (1e9 / expected_hz)
@@ -235,7 +247,7 @@ def analyze_topic(name: str, log_times: list[int], stamp_times: list[int],
                 f"{len(st_gaps)} header stamp gap(s) > {gap_mult:.1f}× expected interval "
                 f"(total lost: {total_st_gap_s:.2f} s)"
             )
-            if len(st_gaps) > 15 or total_st_gap_s > 2.0:
+            if strict_gaps or len(st_gaps) > 15 or total_st_gap_s > 2.0:
                 result["pass"] = False
 
     return result

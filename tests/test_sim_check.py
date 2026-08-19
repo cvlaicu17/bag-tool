@@ -4,29 +4,34 @@ from __future__ import annotations
 
 import pytest
 
-from bag_tool.sim_check import _grade, _topic_stats
+from bag_tool.sim_check import _grade
+from bag_tool.vio_check import analyze_topic
 
 
-def test_topic_stats_reports_clean_400hz_cadence():
+def test_shared_vio_cadence_analysis_reports_clean_400hz_cadence():
     timestamps = [1_000_000_000 + i * 2_500_000 for i in range(401)]
 
-    result = _topic_stats(timestamps)
+    result = analyze_topic("/imu/data_raw", timestamps, timestamps, 400.0,
+                           rate_tolerance=0.02, strict_gaps=True)
 
-    assert result["count"] == 401
-    assert result["rate_hz"] == pytest.approx(400.0)
-    assert result["median_ms"] == pytest.approx(2.5)
+    assert result["msg_count"] == 401
+    assert result["mean_hz"] == pytest.approx(400.0)
+    assert result["log_interval"]["p50"] == pytest.approx(2_500_000)
     assert result["jitter_cv"] == pytest.approx(0.0)
-    assert result["gaps"] == 0
-    assert result["non_monotonic"] == 0
+    assert result["gaps"] == []
+    assert result["non_monotonic_log"] == 0
+    assert result["pass"]
 
 
-def test_topic_stats_detects_gap_and_non_monotonic_timestamp():
+def test_shared_vio_cadence_analysis_detects_gap_and_non_monotonic_timestamp():
     timestamps = [0, 2_500_000, 5_500_000, 45_500_000, 45_000_000]
 
-    result = _topic_stats(timestamps)
+    result = analyze_topic("/imu/data_raw", timestamps, timestamps, 400.0,
+                           rate_tolerance=0.02, strict_gaps=True)
 
-    assert result["gaps"] == 1
-    assert result["non_monotonic"] == 1
+    assert len(result["gaps"]) == 1
+    assert result["non_monotonic_log"] == 1
+    assert not result["pass"]
 
 
 @pytest.mark.parametrize(

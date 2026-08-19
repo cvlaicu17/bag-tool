@@ -9,16 +9,12 @@ reference embedded below.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
-from rosbags.rosbag2 import Reader
-from rosbags.typesys import Stores, get_typestore
 
 from bag_tool.vib_verify import _band, _peaks, _phase_masks, _read
+from bag_tool.vio_check import analyze_topic, read_timestamps
 
-
-_TS = get_typestore(Stores.ROS2_JAZZY)
 
 # Calibrated from day207_vib_targets_v2.json.  Keeping the compact, relevant
 # values in the command makes it usable without a separately distributed JSON.
@@ -49,79 +45,24 @@ class TopicExpectation:
     tolerance: float
 
 
-def _header_stamp_ns(message) -> int | None:
-    """Return a standard ROS Header stamp, if the message has one."""
-    header = getattr(message, "header", None)
-    stamp = getattr(header, "stamp", None)
-    if stamp is None:
-        return None
-    value = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
-    return value if value > 0 else None
-
-
-def _topic_stats(timestamps: list[int], gap_mult: float = 3.0) -> dict:
-    """Cadence statistics robust to a single bad/non-monotonic timestamp."""
-    result = {"count": len(timestamps), "rate_hz": 0.0, "median_ms": 0.0,
-              "jitter_cv": 0.0, "gaps": 0, "non_monotonic": 0}
-    if len(timestamps) < 2:
-        return result
-    values = np.asarray(timestamps, dtype=np.int64)
-    delta = np.diff(values)
-    good = delta > 0
-    result["non_monotonic"] = int((~good).sum())
-    positive = delta[good].astype(float)
-    if not len(positive):
-        return result
-    median_ns = float(np.median(positive))
-    result["median_ms"] = median_ns / 1e6
-    result["jitter_cv"] = float(np.std(positive) / np.mean(positive))
-    result["gaps"] = int((positive > gap_mult * median_ns).sum())
-    duration_ns = values[-1] - values[0]
-    if duration_ns > 0:
-        result["rate_hz"] = float((len(values) - 1) * 1e9 / duration_ns)
-    return result
-
-
-def _read_cadence(bag_path: str, topics: list[str]) -> dict[str, dict[str, list[int]]]:
-    result = {topic: {"log": [], "header": []} for topic in topics}
-    reader_path = Path(bag_path)
-    if reader_path.is_file():
-        reader_path = reader_path.parent
-    with Reader(reader_path) as reader:
-        connections = [conn for conn in reader.connections if conn.topic in result]
-        for conn, timestamp, raw in reader.messages(connections=connections):
-            result[conn.topic]["log"].append(timestamp)
-            msg = _TS.deserialize_cdr(raw, conn.msgtype)
-            stamp = _header_stamp_ns(msg)
-            if stamp is not None:
-                result[conn.topic]["header"].append(stamp)
-    return result
-
-
-def _rate_ok(rate_hz: float, expected_hz: float, tolerance: float) -> bool:
-    return rate_hz > 0 and abs(rate_hz - expected_hz) / expected_hz <= tolerance
-
-
-def _report_topic(expectation: TopicExpectation, captured: dict[str, list[int]],
+def _report_topic(expectation: TopicExpectation, captured: dict,
                   gap_mult: float) -> bool:
-    log = _topic_stats(captured["log"], gap_mult)
-    header = _topic_stats(captured["header"], gap_mult)
-    log_ok = _rate_ok(log["rate_hz"], expectation.rate_hz, expectation.tolerance)
-    header_ok = (not captured["header"] or
-                 _rate_ok(header["rate_hz"], expectation.rate_hz, expectation.tolerance))
-    clean = (log["non_monotonic"] == 0 and log["gaps"] == 0 and
-             header["non_monotonic"] == 0 and header["gaps"] == 0)
-    passed = log_ok and header_ok and clean
-    marker = "PASS" if passed else "FAIL"
-    header_text = "n/a"
-    if captured["header"]:
-        header_text = f"{header['rate_hz']:.2f} Hz"
-    print(f"  [{marker}] {expectation.topic}: n={log['count']}, "
-          f"log={log['rate_hz']:.2f} Hz, header={header_text}, "
-          f"median={log['median_ms']:.3f} ms, jitter={100 * log['jitter_cv']:.2f}%, "
-          f"gaps={log['gaps']}/{header['gaps']}, nonmono={log['non_monotonic']}/{header['non_monotonic']} "
+    result = analyze_topic(expectation.topic, captured["log_times"],
+                           captured["stamp_times"], expectation.rate_hz,
+                           gap_mult=gap_mult, latency_outliers=False,
+                           rate_tolerance=expectation.tolerance, strict_gaps=True)
+    log = result.get("log_interval", {})
+    header = result.get("stamp_interval", {})
+    marker = "PASS" if result["pass"] else "FAIL"
+    header_text = f"{result['stamp_mean_hz']:.2f} Hz" if header else "n/a"
+    print(f"  [{marker}] {expectation.topic}: n={result['msg_count']}, "
+          f"log={result.get('mean_hz', 0.0):.2f} Hz, header={header_text}, "
+          f"median={log.get('p50', log.get('mean', 0.0)) / 1e6:.3f} ms, "
+          f"jitter={100 * result.get('jitter_cv', 0.0):.2f}%, "
+          f"gaps={len(result.get('gaps', []))}/{len(result.get('stamp_gaps', []))}, "
+          f"nonmono={result.get('non_monotonic_log', 0)}/{result.get('non_monotonic_stamp', 0)} "
           f"(expected {expectation.rate_hz:g} Hz ±{100 * expectation.tolerance:g}%)")
-    return passed
+    return result["pass"]
 
 
 def _grade(value: float, reference: float, tiny: float) -> str:
@@ -200,13 +141,13 @@ def run(args) -> None:
     )
     print(f"sim-check: {args.input_bag}")
     print("Cadence (log/header timestamp):")
-    recorded = _read_cadence(args.input_bag, [item.topic for item in expectations])
+    recorded = read_timestamps(args.input_bag, [item.topic for item in expectations])
     cadence_results = [_report_topic(item, recorded[item.topic], args.gap_mult)
                        for item in expectations]
     cadence_pass = all(cadence_results)
 
-    mono = recorded[args.camera_topic]["header"] or recorded[args.camera_topic]["log"]
-    depth = recorded[args.depth_topic]["header"] or recorded[args.depth_topic]["log"]
+    mono = recorded[args.camera_topic]["stamp_times"] or recorded[args.camera_topic]["log_times"]
+    depth = recorded[args.depth_topic]["stamp_times"] or recorded[args.depth_topic]["log_times"]
     paired = mono == depth and len(mono) > 0
     print(f"  [{'PASS' if paired else 'FAIL'}] mono/depth timestamp pairing: "
           f"{len(mono)} / {len(depth)} messages")
