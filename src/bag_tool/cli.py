@@ -309,6 +309,32 @@ def main() -> None:
     vibverify_parser.add_argument("--gt-topic", default="/pf_geo_loc/fc_local_position",
                                   help="Ground-truth pose topic for phase classification")
 
+    # ---- sim subcommand group (tracker-GT benchmark) ----
+    sim_parser = subparsers.add_parser(
+        "sim",
+        help="Sim tracker-GT benchmark: generate GT correspondences and evaluate trackers.",
+    )
+    sim_sub = sim_parser.add_subparsers(dest="sim_command", required=True)
+    sgen = sim_sub.add_parser(
+        "generate-tracker-gt",
+        help="Write tracker output (VINS_TRACK_DUMP) + per-point GT correspondences "
+             "into one self-contained result bag (/tracker_eval/points + /tracker_eval/gt).",
+    )
+    sgen.add_argument("src_bag", help="Source sim bag (depth + GT poses)")
+    sgen.add_argument("out_bag", help="Output result bag to create")
+    sgen.add_argument("--tracker-dump", required=True,
+                      help="VINS_TRACK_DUMP binary from the tracker run")
+    sgen.add_argument("--platform", default="alexios",
+                      help="Camera platform constants (default: alexios)")
+    seval = sim_sub.add_parser(
+        "evaluate-tracker",
+        help="Score a generate-tracker-gt result bag: endpoint error per phase/yaw "
+             "bucket, drift vs track age, gate quality vs truth; writes a score JSON.",
+    )
+    seval.add_argument("result_bag", help="Bag written by generate-tracker-gt")
+    seval.add_argument("--json", default=None, help="Score JSON path "
+                       "(default: <result_bag>.tracker_score.json)")
+
     # ---- sim-check subcommand ----
     simcheck_parser = subparsers.add_parser(
         "sim-check",
@@ -545,6 +571,13 @@ def main() -> None:
             raise SystemExit(1)
         print()
         run_vib_verify(args)
+
+    elif args.command == "sim":
+        from bag_tool.sim_tracker import generate, evaluate
+        if args.sim_command == "generate-tracker-gt":
+            generate(args.src_bag, args.out_bag, args.tracker_dump, args.platform)
+        else:
+            evaluate(args.result_bag, args.json)
 
     elif args.command == "sim-check":
         print()
