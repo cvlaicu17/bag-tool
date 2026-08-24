@@ -12,6 +12,7 @@ dependencies = [
     "rosbags>=0.9",
     "numpy",
     "scipy",
+    "pyyaml",
 ]
 
 [project.scripts]

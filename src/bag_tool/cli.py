@@ -43,6 +43,61 @@ def _ask_vio_topic(current_default: str | None) -> str:
     return value
 
 
+# Keys accepted in an `align --config` YAML file (argparse dests of align flags).
+# Positionals and --config itself are deliberately excluded.
+ALIGN_CONFIG_KEYS = {
+    "vio_topic": str,
+    "platform": str,
+    "eval": bool,
+    "quick": bool,
+    "shrink": bool,
+    "manual": bool,
+    "scale": bool,
+    "new_topic": bool,
+    "rte_window": (int, float),
+    "yaw_rot": int,
+    "out_suffix": str,
+}
+
+
+def _load_align_config(parser: argparse.ArgumentParser, path: str) -> dict:
+    """Load an align --config YAML into a dict of argparse defaults.
+
+    set_defaults() bypasses argparse's choices/type validation, so key names,
+    value types, and enumerated values are validated here instead.
+    """
+    try:
+        import yaml
+    except ImportError:
+        parser.error("--config requires pyyaml (pip install pyyaml)")
+    try:
+        with open(path) as fh:
+            cfg = yaml.safe_load(fh)
+    except OSError as exc:
+        parser.error(f"--config: cannot read {path}: {exc}")
+    except yaml.YAMLError as exc:
+        parser.error(f"--config: invalid YAML in {path}: {exc}")
+    if cfg is None:
+        return {}
+    if not isinstance(cfg, dict):
+        parser.error(f"--config: {path} must contain a YAML mapping")
+
+    unknown = set(cfg) - set(ALIGN_CONFIG_KEYS)
+    if unknown:
+        parser.error(f"--config: unknown keys {sorted(unknown)} "
+                     f"(accepted: {sorted(ALIGN_CONFIG_KEYS)})")
+    for key, value in cfg.items():
+        expected = ALIGN_CONFIG_KEYS[key]
+        if not isinstance(value, expected) or isinstance(value, bool) is not (expected is bool):
+            parser.error(f"--config: key '{key}' expects {expected}, got {value!r}")
+    if "platform" in cfg and cfg["platform"] not in ("auto", *PLATFORMS.keys()):
+        parser.error(f"--config: platform must be one of auto/{'/'.join(PLATFORMS)}, "
+                     f"got {cfg['platform']!r}")
+    if "yaw_rot" in cfg and cfg["yaw_rot"] not in (0, 1, 2, 3):
+        parser.error(f"--config: yaw_rot must be 0-3, got {cfg['yaw_rot']!r}")
+    return cfg
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="bag-tool",
@@ -165,6 +220,12 @@ def main() -> None:
         "--out-suffix", default="", metavar="STR",
         help="Suffix appended to the output directory name "
              "(default: ''; use to avoid clobbering prior runs when sweeping --yaw-rot).",
+    )
+    align_parser.add_argument(
+        "--config", default=None, metavar="FILE",
+        help="YAML file of align options (keys mirror the long flag names, e.g. "
+             "vio_topic, platform, eval, manual, shrink, rte_window). Values act as "
+             "defaults: any flag given explicitly on the command line wins.",
     )
 
     # ---- graft subcommand ----
@@ -428,6 +489,12 @@ def main() -> None:
                                  help="Don't compare barometer metrics to the baked-in Day20 baseline")
     viocheck_parser.add_argument("--plot", action="store_true",
                                  help="Show matplotlib plots")
+
+    # Two-pass parse so `align --config FILE` can supply defaults while explicit
+    # CLI flags keep priority (supplied args out-rank set_defaults automatically).
+    pre_args, _ = parser.parse_known_args()
+    if getattr(pre_args, "command", None) == "align" and getattr(pre_args, "config", None):
+        align_parser.set_defaults(**_load_align_config(parser, pre_args.config))
 
     args = parser.parse_args()
 
