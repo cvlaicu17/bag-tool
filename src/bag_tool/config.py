@@ -56,3 +56,15 @@ def set_vib_targets(path: str) -> None:
     data = _load()
     data["vib_targets"] = path
     _save(data)
+
+
+def get_vib_state() -> str | None:
+    """Return the stored default vib-fit-state coefficients JSON path, or None."""
+    return _load().get("vib_state")
+
+
+def set_vib_state(path: str) -> None:
+    """Persist path as the default vib-fit-state coefficients JSON."""
+    data = _load()
+    data["vib_state"] = path
+    _save(data)

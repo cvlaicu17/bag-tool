@@ -6,7 +6,7 @@ from pathlib import Path
 
 from bag_tool import __version__
 from bag_tool.config import (get_vio_topic, set_vio_topic, get_vib_ref, set_vib_ref,
-                             get_vib_targets, set_vib_targets)
+                             get_vib_targets, set_vib_targets, set_vib_state)
 from bag_tool.ros2_detect import detect_ros2_distro_verbose, detect_stores_enum
 from bag_tool.processor import run as run_convert
 from bag_tool.trim import run as run_trim
@@ -21,6 +21,7 @@ from bag_tool.vio_check import run as run_vio_check
 from bag_tool.filter_imu import run as run_filter_imu
 from bag_tool.vib_check import run as run_vib_check
 from bag_tool.vib_verify import run as run_vib_verify, measure_targets as vib_measure_targets
+from bag_tool.vib_state import run as run_vib_state
 from bag_tool.sim_check import run as run_sim_check
 from bag_tool.platforms import PLATFORMS, detect_from_bag, detect_from_bags
 
@@ -370,6 +371,39 @@ def main() -> None:
     vibverify_parser.add_argument("--gt-topic", default="/pf_geo_loc/fc_local_position",
                                   help="Ground-truth pose topic for phase classification")
 
+    # ---- vib-fit-state subcommand ----
+    vibstate_parser = subparsers.add_parser(
+        "vib-fit-state",
+        help="Fit a continuous flight-state model (climb/sink vertical speed + "
+             "horizontal speed) to a real bag's per-harmonic vibration amplitude, "
+             "superseding the three discrete climb/cruise/descent phases.",
+    )
+    vibstate_parser.add_argument("input_bag",
+                                 help="Reference bag to fit from (.mcap file or directory)")
+    vibstate_parser.add_argument("--imu-topic", default="/imu/data_raw",
+                                 help="IMU topic (default: /imu/data_raw)")
+    vibstate_parser.add_argument("--gt-topic", default="/pf_geo_loc/fc_local_position",
+                                 help="Ground-truth pose topic (default: /pf_geo_loc/fc_local_position)")
+    vibstate_parser.add_argument(
+        "--harmonics", default=None, metavar="F1,F2,F3",
+        help="Comma-separated Hz for harmonic orders 1,2,3 (default: 51.04,103.94,149.01"
+             " -- the assumed real aliased family; the simulator side does not use these"
+             " directly, it aliases its own rotor speed)")
+    vibstate_parser.add_argument(
+        "--half-width-hz", type=float, default=4.0,
+        help="Half-width in Hz of each harmonic's fixed measurement band (default: 4.0)")
+    vibstate_parser.add_argument("--window-s", type=float, default=2.0,
+                                 help="Sliding window length in seconds (default: 2.0)")
+    vibstate_parser.add_argument("--hop-s", type=float, default=0.5,
+                                 help="Sliding window hop in seconds (default: 0.5)")
+    vibstate_parser.add_argument("--json", default=None, metavar="FILE",
+                                 help="Output coefficients JSON path "
+                                      "(default: <bag>_vib_state_v3.json)")
+    vibstate_parser.add_argument(
+        "--set-default", action="store_true",
+        help="After writing the JSON, also save it as bag-tool's default vib-fit-state "
+             "coefficients")
+
     # ---- sim subcommand group (tracker-GT benchmark) ----
     sim_parser = subparsers.add_parser(
         "sim",
@@ -638,6 +672,12 @@ def main() -> None:
             raise SystemExit(1)
         print()
         run_vib_verify(args)
+
+    elif args.command == "vib-fit-state":
+        out_path = run_vib_state(args)
+        if args.set_default:
+            set_vib_state(out_path)
+            print(f"Saved default vib-fit-state coefficients: {out_path}")
 
     elif args.command == "sim":
         from bag_tool.sim_tracker import generate, evaluate
