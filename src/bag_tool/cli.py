@@ -6,7 +6,8 @@ from pathlib import Path
 
 from bag_tool import __version__
 from bag_tool.config import (get_vio_topic, set_vio_topic, get_vib_ref, set_vib_ref,
-                             get_vib_targets, set_vib_targets, get_vib_state, set_vib_state)
+                             get_vib_targets, set_vib_targets, get_vib_state, set_vib_state,
+                             get_vib_harmonic_targets, set_vib_harmonic_targets)
 from bag_tool.ros2_detect import detect_ros2_distro_verbose, detect_stores_enum
 from bag_tool.processor import run as run_convert
 from bag_tool.trim import run as run_trim
@@ -20,7 +21,8 @@ from bag_tool.scale_eval import run as run_scale_eval
 from bag_tool.vio_check import run as run_vio_check
 from bag_tool.filter_imu import run as run_filter_imu
 from bag_tool.vib_check import run as run_vib_check
-from bag_tool.vib_verify import run as run_vib_verify, measure_targets as vib_measure_targets
+from bag_tool.vib_verify import (run as run_vib_verify, measure_targets as vib_measure_targets,
+                                 measure_harmonic_targets as vib_measure_harmonic_targets)
 from bag_tool.vib_state import run as run_vib_state
 from bag_tool.sim_check import run as run_sim_check
 from bag_tool.platforms import PLATFORMS, detect_from_bag, detect_from_bags
@@ -380,6 +382,17 @@ def main() -> None:
         "--sat-k", type=float, default=3.0,
         help="Soft-saturation ceiling multiple used to report the 'deep extrapolation' "
              "fraction (default: 3.0, matching add_vibration.py's VIB_STATE_SAT_K default)")
+    vibverify_parser.add_argument(
+        "--harmonic-targets", default=None, metavar="JSON",
+        help="Harmonic-indexed targets JSON (vib-fit-harmonic-targets schema). If given "
+             "(or a default is set via 'vib-fit-harmonic-targets --set-default'), also "
+             "grades each harmonic at wherever it actually sits, plus a bucket-agnostic "
+             "total-energy figure -- instead of only the fixed 20-100/100-195 Hz buckets.")
+    vibverify_parser.add_argument(
+        "--rotor-npz", default=None, metavar="NPZ",
+        help="This bag's own <bag>_rotor_states.npz sidecar (sim bags only). With "
+             "--harmonic-targets, tells the harmonic-indexed check where THIS bag's own "
+             "lines actually sit, instead of assuming the targets file's frequencies.")
 
     # ---- vib-fit-state subcommand ----
     vibstate_parser = subparsers.add_parser(
@@ -413,6 +426,33 @@ def main() -> None:
         "--set-default", action="store_true",
         help="After writing the JSON, also save it as bag-tool's default vib-fit-state "
              "coefficients")
+
+    # ---- vib-fit-harmonic-targets subcommand ----
+    vibharm_parser = subparsers.add_parser(
+        "vib-fit-harmonic-targets",
+        help="Measure phase-resolved, HARMONIC-INDEXED vibration targets from a real "
+             "bag: each harmonic at its own frequency (not a fixed 20-100/100-195 Hz "
+             "bucket), plus a bucket-agnostic total-energy figure.",
+    )
+    vibharm_parser.add_argument("input_bag",
+                                help="Reference bag to measure from (.mcap file or directory)")
+    vibharm_parser.add_argument("--imu-topic", default="/imu/data_raw",
+                                help="IMU topic (default: /imu/data_raw)")
+    vibharm_parser.add_argument("--gt-topic", default="/pf_geo_loc/fc_local_position",
+                                help="Ground-truth pose topic (default: /pf_geo_loc/fc_local_position)")
+    vibharm_parser.add_argument(
+        "--harmonics", default=None, metavar="F1,F2,F3",
+        help="Comma-separated Hz for harmonic orders 1,2,3 (default: 51.04,103.94,149.01 "
+             "-- the assumed real aliased family, same default as vib-fit-state)")
+    vibharm_parser.add_argument(
+        "--half-width-hz", type=float, default=4.0,
+        help="Half-width in Hz of each harmonic's measurement band (default: 4.0)")
+    vibharm_parser.add_argument("--json", default=None, metavar="FILE",
+                                help="Output targets JSON path "
+                                     "(default: <bag>_vib_harmonic_targets.json)")
+    vibharm_parser.add_argument(
+        "--set-default", action="store_true",
+        help="After writing the JSON, also save it as bag-tool's default harmonic targets")
 
     # ---- sim subcommand group (tracker-GT benchmark) ----
     sim_parser = subparsers.add_parser(
@@ -683,6 +723,9 @@ def main() -> None:
         if not args.state:
             args.state = get_vib_state()   # silently absent is fine -- envelope report
                                             # is informational, not required to verify
+        if not args.harmonic_targets:
+            args.harmonic_targets = get_vib_harmonic_targets()  # silently absent is fine --
+                                            # harmonic-indexed check is additive, not required
         print()
         run_vib_verify(args)
 
@@ -691,6 +734,26 @@ def main() -> None:
         if args.set_default:
             set_vib_state(out_path)
             print(f"Saved default vib-fit-state coefficients: {out_path}")
+
+    elif args.command == "vib-fit-harmonic-targets":
+        harmonics = None
+        if args.harmonics:
+            harmonics = {i: float(tok) for i, tok in
+                        enumerate(args.harmonics.split(","), start=1)}
+        result = vib_measure_harmonic_targets(args.input_bag, harmonics, args.half_width_hz,
+                                              args.imu_topic, args.gt_topic)
+        out_path = args.json or str(Path(args.input_bag).with_suffix("")) + "_vib_harmonic_targets.json"
+        import json as _json2
+        with open(out_path, "w") as fh:
+            _json2.dump(result, fh, indent=2)
+        print(f"harmonics (Hz): " + ", ".join(f"{h}x={f:.2f}" for h, f in
+              sorted(((int(k), v) for k, v in result["harmonics_hz"].items()))))
+        for pname, d in result["phases"].items():
+            print(f"  [{pname}] {d['seconds']:.0f}s")
+        print(f"\nwrote {out_path}")
+        if args.set_default:
+            set_vib_harmonic_targets(out_path)
+            print(f"Saved default harmonic targets: {out_path}")
 
     elif args.command == "sim":
         from bag_tool.sim_tracker import generate, evaluate

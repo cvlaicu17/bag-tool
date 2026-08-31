@@ -14,7 +14,14 @@ whatever this script measures.
 Per harmonic order h in {1,2,3} and channel (accel/gyro x,y,z), fits in log space:
 
     log A_h(t) = log A0_h + beta_plus_h * vz_plus(t) + beta_minus_h * vz_minus(t)
-                           + gamma_h * vh(t)
+                           + gamma_h * vh(t) + resid(t)
+
+The regression only explains a fraction of the variance (R^2 0.02-0.38 on day20.7 --
+the rest is gusts, control activity, turbulence). resid(t) is not discarded: its
+stationary std (sigma) and lag-1-autocorrelation-implied correlation time (tau_s) are
+fitted too and written out per channel/harmonic, so a synthesiser can play back a
+matching AR(1) log-amplitude modulation on top of the deterministic mean and recover
+the real bag's total energy (mean^2 + variance), not just its mean.
 
   vz_plus  = max(vz, 0)   (climbing component)
   vz_minus = min(vz, 0)   (sinking component -- propwash is asymmetric, so this gets its
@@ -134,19 +141,45 @@ def _window_amplitudes(x: np.ndarray, fs: float, freqs_hz: dict[int, float],
 
 
 # ── fitting ──────────────────────────────────────────────────────────────────
-def _fit_log_linear(y: np.ndarray, vzp: np.ndarray, vzn: np.ndarray, vh: np.ndarray):
+def _fit_log_linear(y: np.ndarray, vzp: np.ndarray, vzn: np.ndarray, vh: np.ndarray,
+                    hop_s: float):
     """log(y) ~ intercept + beta_plus*vzp + beta_minus*vzn + gamma*vh. Returns the
     coefficients plus R^2, so a fit that explains nothing is visible rather than
-    silently accepted."""
+    silently accepted.
+
+    Also returns the RESIDUAL's own statistics (sigma, tau_s). The regression only
+    captures the mean response to state; what's left over is not noise to discard --
+    it's real, slowly-varying amplitude modulation (gusts, turbulence, control
+    activity) that today's synthesis drops on the floor. The residual is strongly
+    autocorrelated (measured on day20.7: lag-1 rho ~0.78-0.90 at a 0.5s hop, i.e. a
+    correlation time of several seconds, not white noise), so it is characterised as
+    an AR(1) process: sigma is its stationary std in log-space, tau_s its correlation
+    time. A synthesiser can then play a matching AR(1) process back on top of the
+    fitted mean, closing the gap between a deterministic mean-amplitude injection and
+    the real bag's total (mean^2 + variance) energy -- without touching A0/beta/gamma,
+    which keep meaning "the mean response to state" exactly as before.
+    """
     ylog = np.log(np.maximum(y, 1e-9))
     X = np.column_stack([np.ones(len(y)), vzp, vzn, vh])
     coef, *_ = np.linalg.lstsq(X, ylog, rcond=None)
     pred = X @ coef
-    ss_res = float(((ylog - pred) ** 2).sum())
+    resid = ylog - pred
+    ss_res = float((resid ** 2).sum())
     ss_tot = float(((ylog - ylog.mean()) ** 2).sum())
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    sigma = float(resid.std())
+    if len(resid) > 3 and sigma > 0:
+        rho = float(np.corrcoef(resid[:-1], resid[1:])[0, 1])
+    else:
+        rho = 0.0
+    rho = min(max(rho, 0.0), 0.995)
+    # A near-zero (or negative) lag-1 autocorrelation means the residual is
+    # essentially white at this hop spacing -- fall back to a correlation time of
+    # one hop rather than blowing up -hop_s/log(rho) near rho=0.
+    tau_s = -hop_s / np.log(rho) if rho > 0.05 else hop_s
     return {"A0": float(np.exp(coef[0])), "beta_plus": float(coef[1]),
-            "beta_minus": float(coef[2]), "gamma": float(coef[3]), "r2": float(r2)}
+            "beta_minus": float(coef[2]), "gamma": float(coef[3]), "r2": float(r2),
+            "sigma": sigma, "tau_s": float(tau_s)}
 
 
 def fit_state(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str = GT_TOPIC,
@@ -183,7 +216,7 @@ def fit_state(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str = GT_TOPI
             vz_c, vh_c = vz[np.clip(centers, 0, len(vz) - 1)], vh[np.clip(centers, 0, len(vh) - 1)]
             vzp, vzn = np.maximum(vz_c, 0), np.minimum(vz_c, 0)
         out["channels"][name] = {
-            str(h): _fit_log_linear(amps[h][fly], vzp[fly], vzn[fly], vh_c[fly])
+            str(h): _fit_log_linear(amps[h][fly], vzp[fly], vzn[fly], vh_c[fly], hop_s)
             for h in harmonics
         }
 
@@ -217,7 +250,7 @@ def run(args) -> str:
          f"vh [{sr['vh_min']:.2f}, {sr['vh_max']:.2f}] m/s")
     print(SEP)
     print(f"{'channel':<10} {'h':>2}  {'A0':>9} {'beta+':>8} {'beta-':>8} "
-         f"{'gamma':>8} {'r2':>6}")
+         f"{'gamma':>8} {'r2':>6} {'sigma':>7} {'tau_s':>6}")
     low_r2 = 0
     for name, hh in result["channels"].items():
         for h, c in hh.items():
@@ -225,7 +258,8 @@ def run(args) -> str:
             if c["r2"] < 0.10:
                 low_r2 += 1
             print(f"{name:<10} {h:>2}  {c['A0']:9.4f} {c['beta_plus']:8.3f} "
-                 f"{c['beta_minus']:8.3f} {c['gamma']:8.3f} {c['r2']:6.3f}{mark}")
+                 f"{c['beta_minus']:8.3f} {c['gamma']:8.3f} {c['r2']:6.3f} "
+                 f"{c['sigma']:7.3f} {c['tau_s']:6.1f}{mark}")
     print(SEP)
     verdict = ok if low_r2 == 0 else warn
     print(verdict(f"{low_r2} of {sum(len(v) for v in result['channels'].values())} "

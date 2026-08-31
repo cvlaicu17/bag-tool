@@ -12,6 +12,18 @@ cruise / descent, classified from ground-truth vertical velocity) and per axis:
 Reference targets come from --targets JSON (schema of day207_vib_targets_v2.json /
 measure_vib_targets_v2.py), from --ref REAL_BAG (derived on the fly, optionally
 --save-targets), or from the config-stored default (--set-targets persists one).
+
+Additionally, --harmonic-targets JSON (schema of measure_harmonic_targets / the
+'vib-fit-harmonic-targets' subcommand) enables a HARMONIC-INDEXED check: each
+harmonic is measured at wherever it actually sits -- the bag's OWN predicted line
+position (from --rotor-npz if given, else the frequencies the targets file itself
+assumes) -- rather than in a fixed 20-100/100-195 Hz bucket. This matters because the
+"frequencies come from the simulated props" decision means a sim bag's aliased lines
+do not sit at the same Hz as the real bag's: a fixed-bucket check silently changes
+which harmonics it is even measuring once a line crosses a bucket boundary. A
+bucket-agnostic total-energy check (20-195 Hz, wherever the lines are) is measured
+alongside it, so realism can be judged even when the harmonic-position assumption
+itself is wrong.
 """
 from __future__ import annotations
 
@@ -25,7 +37,7 @@ from rosbags.rosbag2 import Reader
 from rosbags.typesys import Stores, get_typestore
 
 from bag_tool.vib_check import ok, warn, fail, hdr, SEP
-from bag_tool.vib_state import state_series
+from bag_tool.vib_state import state_series, DEFAULT_HARMONICS, DEFAULT_HALF_WIDTH_HZ
 
 _TS = get_typestore(Stores.ROS2_JAZZY)
 IMU_TOPIC = "/imu/data_raw"
@@ -65,13 +77,17 @@ def _read(bag_path: str, imu_topic: str, gt_topic: str):
 
 # ── phases / spectra ──────────────────────────────────────────────────────────
 def _phase_masks(ti, tg, zg):
+    """Tiled thresholds (0.3/0.3/-0.3), matching add_vibration.py's own phase masks --
+    the old 0.5/0.3/-0.3 split left 0.3 < vz <= 0.5 claimed by no phase. Grading and
+    synthesis must agree on what "climb" means, or a mission that spends time in that
+    gap gets graded against a phase boundary the synthesiser doesn't actually use."""
     h = -(zg - zg[0])
     vz = np.gradient(h) / np.maximum(np.gradient(tg), 1e-6)
     k = max(3, int(2 / max(np.median(np.diff(tg)), 1e-3)))
     vz = np.convolve(vz, np.ones(k) / k, mode="same")
     vzi = np.interp(ti, tg, vz); hi = np.interp(ti, tg, h)
     flight = hi > 2.0
-    return {"climb": flight & (vzi > 0.5),
+    return {"climb": flight & (vzi > 0.3),
             "cruise": flight & (np.abs(vzi) <= 0.3),
             "descent": flight & (vzi < -0.3)}, hi
 
@@ -101,6 +117,59 @@ def _peaks(x, fs, n=5):
         if len(out) >= n:
             break
     return sorted(out)
+
+
+# ── harmonic-indexed targets/measurement ────────────────────────────────────────
+def _alias_fold(f: float, fs: float) -> float:
+    """Fold a true frequency into [0, fs/2) the way discrete-time sampling actually
+    does -- add_vibration.py evaluates continuous-time tones at the IMU sample times,
+    so what lands in the bag is each harmonic's ALIAS, not its true frequency. A 2x/3x
+    harmonic of a several-hundred-Hz shaft is typically several times fs itself."""
+    fs2 = fs / 2.0
+    m = f % fs
+    return fs - m if m > fs2 else m
+
+
+def _sim_own_harmonics(rotor_npz: str, fs: float) -> dict[int, float] | None:
+    """The bag's OWN predicted harmonic frequencies, ALIASED at this bag's sample
+    rate, from its rotor-speed sidecar (the same file add_vibration.py reads).
+    Returns None if the sidecar has no meaningful motors-on time -- callers should
+    fall back to an assumed family."""
+    rs = np.load(rotor_npz)
+    speeds = rs["speeds"]
+    shaft = speeds.mean(axis=1) / (2 * np.pi)
+    on = shaft > 50
+    if on.sum() < 10:
+        return None
+    f0 = float(np.median(shaft[on]))
+    return {h: _alias_fold(h * f0, fs) for h in (1, 2, 3)}
+
+
+def measure_harmonic_targets(bag_path: str, harmonics: dict[int, float] | None = None,
+                             half_width_hz: float = DEFAULT_HALF_WIDTH_HZ,
+                             imu_topic: str = IMU_TOPIC, gt_topic: str = GT_TOPIC) -> dict:
+    """Derive phase-resolved, HARMONIC-INDEXED targets from a reference bag: each
+    harmonic measured at its own frequency (not a fixed bucket), plus a bucket-
+    agnostic total-energy figure (20-195 Hz) that stays meaningful even if the
+    harmonic-position assumption is later found wrong."""
+    harmonics = harmonics or DEFAULT_HARMONICS
+    ti, acc, gyr, tg, pos = _read(bag_path, imu_topic, gt_topic)
+    fs = 1 / np.median(np.diff(ti))
+    masks, _ = _phase_masks(ti, tg, pos[:, 2])
+    out = {"fs": float(fs), "source": str(bag_path),
+           "harmonics_hz": {str(h): f for h, f in harmonics.items()},
+           "half_width_hz": half_width_hz, "phases": {}}
+    for pname, mk in masks.items():
+        d = {"seconds": float(mk.sum() / fs)}
+        for sname, arr in (("accel", acc), ("gyro", gyr)):
+            for ax, lbl in enumerate("xyz"):
+                x = arr[mk, ax]
+                ch = {str(h): _band(x, max(f0 - half_width_hz, 0.5), f0 + half_width_hz, fs)
+                     for h, f0 in harmonics.items()}
+                ch["total"] = _band(x, 20, 195, fs)
+                d[f"{sname}_{lbl}"] = ch
+        out["phases"][pname] = d
+    return out
 
 
 def measure_targets(bag_path: str, imu_topic: str = IMU_TOPIC,
@@ -164,6 +233,48 @@ def _state_envelope_report(ti, tg, pos, state_path: str, sat_k: float) -> None:
          f"({100*deep.mean():.1f}%) are past 2x the edge.")
 
 
+def _harmonic_report(ti, acc, gyr, tg, pos, masks, fs, harmonic_targets_path: str,
+                     rotor_npz: str | None) -> dict:
+    """Harmonic-indexed check: grade each harmonic where THIS bag actually put it
+    (own rotor sidecar if given, else the assumed family the targets themselves
+    used), plus a bucket-agnostic total-energy figure. Returns ok/warn/fail counts
+    so the caller can fold them into the overall verdict."""
+    htgt = json.load(open(harmonic_targets_path))
+    own = _sim_own_harmonics(rotor_npz, fs) if rotor_npz else None
+    if own is None:
+        own = {int(k): v for k, v in htgt["harmonics_hz"].items()}
+        src = "assumed family (targets file; no --rotor-npz given or motors never on)"
+    else:
+        src = f"this bag's own rotor sidecar ({rotor_npz})"
+    hw = htgt.get("half_width_hz", DEFAULT_HALF_WIDTH_HZ)
+    print(hdr(f"\n[harmonic-indexed]  measured at {src}"))
+    print("  " + ", ".join(f"{h}x={f:.2f}Hz" for h, f in sorted(own.items())))
+    counts = {"ok": 0, "warn": 0, "fail": 0}
+    for pname, mk in masks.items():
+        if pname not in htgt["phases"] or mk.sum() < fs * 5:
+            continue
+        print(f"  [{pname}]")
+        for sname, arr, tiny in (("accel", acc, 0.02), ("gyro", gyr, 0.01)):
+            for ax, lbl in enumerate("xyz"):
+                x = arr[mk, ax]
+                tgt = htgt["phases"][pname][f"{sname}_{lbl}"]
+                cells = []
+                for h, f0 in sorted(own.items()):
+                    lo, hi_ = max(f0 - hw, 0.5), min(f0 + hw, fs / 2 - 0.5)
+                    sim = _band(x, lo, hi_, fs)
+                    g, txt = _grade(sim, tgt[str(h)], tiny)
+                    counts[g] += 1
+                    mark = {"ok": "✔", "warn": "⚠", "fail": "✘"}[g]
+                    cells.append(f"{h}x {sim:6.3f}/{tgt[str(h)]:6.3f} {mark}{txt}")
+                sim_tot = _band(x, 20, 195, fs)
+                g, txt = _grade(sim_tot, tgt["total"], tiny)
+                counts[g] += 1
+                mark = {"ok": "✔", "warn": "⚠", "fail": "✘"}[g]
+                cells.append(f"tot {sim_tot:6.3f}/{tgt['total']:6.3f} {mark}{txt}")
+                print(f"    {sname}_{lbl}:  " + "  ".join(cells))
+    return counts
+
+
 def run(args) -> None:
     targets = json.load(open(args.targets))
     print(hdr(f"vib-verify: {args.input_bag}"))
@@ -203,8 +314,19 @@ def run(args) -> None:
     # ground silence
     g = (ti < ti[0] + 30) & (hi < 1.0)
     if g.sum() > fs * 3:
+        # This is a TIME/HEIGHT proxy for "motors off", not a direct motor-speed check --
+        # add_vibration.py now gates tones on the rotor sidecar's own "spinning" state, not
+        # on this proxy, so a mission that arms and spools up before the first 30s/1m are
+        # up (common) will show a small, EXPECTED non-zero reading here, not a bug.
         print(f"ground-rest accZ  : {acc[g, 2].std():.3f} m/s² "
-              "(should be sensor-noise level: motors off ⇒ no vibration)")
+              "(should be sensor-noise level if motors are truly off in this window; "
+              "see caveat above if the mission arms/spools up early)")
+    if getattr(args, "harmonic_targets", None):
+        print(SEP)
+        hcounts = _harmonic_report(ti, acc, gyr, tg, pos, masks, fs,
+                                   args.harmonic_targets, getattr(args, "rotor_npz", None))
+        for k in counts:
+            counts[k] += hcounts[k]
     if getattr(args, "state", None):
         print(SEP)
         _state_envelope_report(ti, tg, pos, args.state, args.sat_k)

@@ -68,3 +68,15 @@ def set_vib_state(path: str) -> None:
     data = _load()
     data["vib_state"] = path
     _save(data)
+
+
+def get_vib_harmonic_targets() -> str | None:
+    """Return the stored default harmonic-indexed vib targets JSON path, or None."""
+    return _load().get("vib_harmonic_targets")
+
+
+def set_vib_harmonic_targets(path: str) -> None:
+    """Persist path as the default harmonic-indexed vib targets JSON."""
+    data = _load()
+    data["vib_harmonic_targets"] = path
+    _save(data)
