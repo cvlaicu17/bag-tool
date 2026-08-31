@@ -6,7 +6,7 @@ from pathlib import Path
 
 from bag_tool import __version__
 from bag_tool.config import (get_vio_topic, set_vio_topic, get_vib_ref, set_vib_ref,
-                             get_vib_targets, set_vib_targets, set_vib_state)
+                             get_vib_targets, set_vib_targets, get_vib_state, set_vib_state)
 from bag_tool.ros2_detect import detect_ros2_distro_verbose, detect_stores_enum
 from bag_tool.processor import run as run_convert
 from bag_tool.trim import run as run_trim
@@ -370,6 +370,16 @@ def main() -> None:
                                   help="IMU topic (default: /imu/data_raw)")
     vibverify_parser.add_argument("--gt-topic", default="/pf_geo_loc/fc_local_position",
                                   help="Ground-truth pose topic for phase classification")
+    vibverify_parser.add_argument(
+        "--state", default=None, metavar="JSON",
+        help="vib-fit-state coefficients JSON (day207_vib_state_v3.json schema). If "
+             "given (or a default is set via 'vib-fit-state --set-default'), reports "
+             "what fraction of this bag's flight state falls outside the range those "
+             "coefficients were fitted over -- informational, not scored.")
+    vibverify_parser.add_argument(
+        "--sat-k", type=float, default=3.0,
+        help="Soft-saturation ceiling multiple used to report the 'deep extrapolation' "
+             "fraction (default: 3.0, matching add_vibration.py's VIB_STATE_SAT_K default)")
 
     # ---- vib-fit-state subcommand ----
     vibstate_parser = subparsers.add_parser(
@@ -670,6 +680,9 @@ def main() -> None:
         if not args.targets:
             print("ERROR: no targets. Use --targets JSON, --ref BAG, or --set-targets JSON.")
             raise SystemExit(1)
+        if not args.state:
+            args.state = get_vib_state()   # silently absent is fine -- envelope report
+                                            # is informational, not required to verify
         print()
         run_vib_verify(args)
 

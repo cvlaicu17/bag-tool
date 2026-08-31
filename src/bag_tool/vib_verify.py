@@ -25,6 +25,7 @@ from rosbags.rosbag2 import Reader
 from rosbags.typesys import Stores, get_typestore
 
 from bag_tool.vib_check import ok, warn, fail, hdr, SEP
+from bag_tool.vib_state import state_series
 
 _TS = get_typestore(Stores.ROS2_JAZZY)
 IMU_TOPIC = "/imu/data_raw"
@@ -34,7 +35,10 @@ FLOOR_FREQS = np.linspace(5, 195, 48)
 
 # ── bag reading ────────────────────────────────────────────────────────────────
 def _read(bag_path: str, imu_topic: str, gt_topic: str):
-    t_i, acc, gyr, t_g, z_g = [], [], [], [], []
+    """Returns (ti, acc, gyr, tg, pos) -- pos is (N,3) x/y/z, so callers that only need
+    phase classification use pos[:,2] and callers that also need horizontal speed (the
+    state envelope check) have x/y without a second pass over the bag."""
+    t_i, acc, gyr, t_g, pos = [], [], [], [], []
     with Reader(Path(bag_path)) as reader:
         conns = [c for c in reader.connections if c.topic in (imu_topic, gt_topic)]
         for conn, ts, raw in reader.messages(connections=conns):
@@ -46,7 +50,9 @@ def _read(bag_path: str, imu_topic: str, gt_topic: str):
                 gyr.append((msg.angular_velocity.x, msg.angular_velocity.y,
                             msg.angular_velocity.z))
             else:
-                t_g.append(ts); z_g.append(msg.pose.position.z)
+                t_g.append(ts)
+                p = msg.pose.position
+                pos.append((p.x, p.y, p.z))
     if not t_i:
         raise SystemExit(f"ERROR: no {imu_topic} messages in {bag_path}")
     if not t_g:
@@ -54,7 +60,7 @@ def _read(bag_path: str, imu_topic: str, gt_topic: str):
                          "(needed for phase classification)")
     t0 = t_i[0]
     return (np.array(t_i) - t0) / 1e9, np.array(acc), np.array(gyr), \
-           (np.array(t_g) - t0) / 1e9, np.array(z_g)
+           (np.array(t_g) - t0) / 1e9, np.array(pos)
 
 
 # ── phases / spectra ──────────────────────────────────────────────────────────
@@ -100,9 +106,9 @@ def _peaks(x, fs, n=5):
 def measure_targets(bag_path: str, imu_topic: str = IMU_TOPIC,
                     gt_topic: str = GT_TOPIC) -> dict:
     """Derive phase-resolved targets from a reference bag (schema v2)."""
-    ti, acc, gyr, tg, zg = _read(bag_path, imu_topic, gt_topic)
+    ti, acc, gyr, tg, pos = _read(bag_path, imu_topic, gt_topic)
     fs = 1 / np.median(np.diff(ti))
-    masks, _ = _phase_masks(ti, tg, zg)
+    masks, _ = _phase_masks(ti, tg, pos[:, 2])
     out = {"fs": float(fs), "source": str(bag_path),
            "floor_freqs": [float(v) for v in FLOOR_FREQS], "phases": {}}
     for pname, mk in masks.items():
@@ -132,14 +138,40 @@ def _grade(sim: float, real: float, tiny: float) -> tuple[str, str]:
     return "fail", f"{r:5.2f}x"
 
 
+def _state_envelope_report(ti, tg, pos, state_path: str, sat_k: float) -> None:
+    """Informational, not scored: how much of this bag's flight state falls outside the
+    range day207_vib_state_v3.json was fitted over. add_vibration.py soft-saturates past
+    that range rather than failing, so this is context for how much of the mission relied
+    on that extrapolation -- not a pass/fail signal on its own."""
+    state = json.load(open(state_path))
+    SR = state["state_ranges"]
+    hgt, vz, vh = state_series(ti, tg, pos)
+    fly = hgt > 2.0
+    if fly.sum() < 10:
+        print(f"state envelope: too few airborne samples ({fly.sum()}) to report")
+        return
+    vzp, vzn, vhf = np.maximum(vz[fly], 0), np.minimum(vz[fly], 0), vh[fly]
+    beyond = (vzp > SR["vz_max"]) | (vzn < SR["vz_min"]) | (vhf > SR["vh_max"])
+    deep = (vzp > 2 * SR["vz_max"]) | (vzn < 2 * SR["vz_min"]) | (vhf > 2 * SR["vh_max"])
+    print(f"state envelope ({Path(state_path).name}):")
+    print(f"  calibrated : vz [{SR['vz_min']:.2f},{SR['vz_max']:.2f}] m/s   "
+         f"vh_max {SR['vh_max']:.2f} m/s")
+    print(f"  this bag   : vz [{vz[fly].min():.2f},{vz[fly].max():.2f}] m/s   "
+         f"vh_max {vhf.max():.2f} m/s")
+    print(f"  {beyond.sum()}/{fly.sum()} airborne samples ({100*beyond.mean():.1f}%) exceed "
+         f"the calibrated range -- soft-saturated extrapolation there (ceiling "
+         f"{sat_k:.1f}x the edge), not a direct measurement. {deep.sum()} "
+         f"({100*deep.mean():.1f}%) are past 2x the edge.")
+
+
 def run(args) -> None:
     targets = json.load(open(args.targets))
     print(hdr(f"vib-verify: {args.input_bag}"))
     print(f"targets   : {args.targets} (source: {targets.get('source', 'n/a')})")
     print(SEP)
-    ti, acc, gyr, tg, zg = _read(args.input_bag, args.imu_topic, args.gt_topic)
+    ti, acc, gyr, tg, pos = _read(args.input_bag, args.imu_topic, args.gt_topic)
     fs = 1 / np.median(np.diff(ti))
-    masks, hi = _phase_masks(ti, tg, zg)
+    masks, hi = _phase_masks(ti, tg, pos[:, 2])
     counts = {"ok": 0, "warn": 0, "fail": 0}
     for pname, mk in masks.items():
         if pname not in targets["phases"] or mk.sum() < fs * 5:
@@ -173,6 +205,9 @@ def run(args) -> None:
     if g.sum() > fs * 3:
         print(f"ground-rest accZ  : {acc[g, 2].std():.3f} m/s² "
               "(should be sensor-noise level: motors off ⇒ no vibration)")
+    if getattr(args, "state", None):
+        print(SEP)
+        _state_envelope_report(ti, tg, pos, args.state, args.sat_k)
     print(SEP)
     verdict = ok if counts["fail"] == 0 and counts["warn"] <= 6 else \
         (warn if counts["fail"] <= 2 else fail)

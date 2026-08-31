@@ -94,7 +94,7 @@ def _smooth(x: np.ndarray, n: float) -> np.ndarray:
     return np.convolve(x, np.ones(n) / n, mode="same")
 
 
-def _state_series(ti: np.ndarray, tg: np.ndarray, pos: np.ndarray):
+def state_series(ti: np.ndarray, tg: np.ndarray, pos: np.ndarray):
     """Height (NED, up-positive) plus smoothed vertical/horizontal speed, resampled
     onto the IMU timeline. NED convention matches vib_verify._phase_masks and
     add_vibration.py -- kept consistent rather than re-derived per bag."""
@@ -157,7 +157,7 @@ def fit_state(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str = GT_TOPI
     harmonics = harmonics or DEFAULT_HARMONICS
     ti, acc, gyr, tg, pos = _read(bag_path, imu_topic, gt_topic)
     fs = 1.0 / np.median(np.diff(ti))
-    hgt, vz, vh = _state_series(ti, tg, pos)
+    hgt, vz, vh = state_series(ti, tg, pos)
 
     channels = {"accel_x": acc[:, 0], "accel_y": acc[:, 1], "accel_z": acc[:, 2],
                "gyro_x": gyr[:, 0], "gyro_y": gyr[:, 1], "gyro_z": gyr[:, 2]}
