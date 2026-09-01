@@ -1,0 +1,152 @@
+{
+  "generated": "2026-09-01T12:56:19+03:00",
+  "corpus": {
+    "real_bags_local_jazzy": [
+      "Day20.1",
+      "Day20.2",
+      "Day20.3",
+      "Day20.5",
+      "Day20.6",
+      "Day20.7",
+      "Day20.8",
+      "Day32"
+    ],
+    "sim_bags_v2_aupt04_cache": [
+      "pas_d04_vib2",
+      "pas_d07_vib2",
+      "pas_d03_vib2",
+      "pas_d01_vib2",
+      "pas_d02_vib2",
+      "pas_d05_vib2",
+      "pas_d08_vib2",
+      "pas_d06_vib2",
+      "pas_d09_vib2",
+      "pas_d10_vib2"
+    ],
+    "sim_bags_local": [
+      "pas_d01_vib2",
+      "pas_d05_vib2",
+      "pas_d09_vib2",
+      "pas_d01_vib3"
+    ],
+    "controls_aupt04": [
+      "raw_unvibed(fleet3/pas_d01)",
+      "current_v3ar1",
+      "no_modulation(VIB_STATE_MODULATE=0)"
+    ],
+    "note": "skygate cache holds 7 real + 10 sim bags, NOT 17 real. Day32 exists only locally. The *_jazzy conversions are TRIMMED (Day20.8: 473s vs the original recording's 593s), so the two reads of one flight can select different steady blocks and give different metric values."
+  },
+  "observed_ranges": {
+    "C1.white_flat.flatness": {
+      "real": [
+        0.21,
+        0.95
+      ],
+      "sim": [
+        0.86,
+        0.92
+      ]
+    },
+    "C2.breathe.cv": {
+      "real": [
+        0.18,
+        0.36
+      ],
+      "sim": [
+        0.06,
+        0.09
+      ]
+    },
+    "C2.exists.lowband_over_white": {
+      "real": [
+        1.47,
+        9.45
+      ],
+      "sim": [
+        1.43,
+        72.46
+      ]
+    },
+    "C2.gaussian.excess_kurtosis": {
+      "real": [
+        0.36,
+        4.59
+      ],
+      "sim": [
+        -0.02,
+        0.05
+      ]
+    },
+    "C3.breathe.sigma_log": {
+      "real": [
+        0.337,
+        0.536
+      ],
+      "sim": [
+        0.204,
+        0.513
+      ]
+    },
+    "C3.breathe.tau_s": {
+      "real": [
+        1.7,
+        6.6
+      ],
+      "sim": [
+        1.4,
+        2.4
+      ]
+    },
+    "C3.exist.top_prom_db": {
+      "real": [
+        5.1,
+        9.0
+      ],
+      "sim": [
+        4.3,
+        6.2
+      ]
+    },
+    "C3.responsive.p90_p10": {
+      "real": [
+        2.38,
+        3.84
+      ],
+      "sim": [
+        1.47,
+        3.81
+      ]
+    },
+    "C3.width.width_hz": {
+      "real": [
+        0.78,
+        8.31
+      ],
+      "sim": [
+        9.47,
+        14.11
+      ]
+    },
+    "C6.flat.flatness": {
+      "real": [
+        0.947,
+        0.986
+      ],
+      "sim": [
+        0.961,
+        0.985
+      ]
+    }
+  },
+  "acceptance": "every real bag must PASS (no fail); a threshold a real bag violates is a wrong threshold",
+  "results": {
+    "real_pass": "8/8 clean (0 fail, 0 warn) on the _jazzy reads",
+    "sim_v2_fail": "10/10 on aupt04 cache + 3/3 locally",
+    "controls": "raw_unvibed FAIL, no_modulation FAIL, current_v3ar1 FAIL (5 checks)"
+  },
+  "known_metric_issues": [
+    "C3.breathe measures TOTAL band-amplitude variability, which the broadband floor dominates; it reports 0.352 with AR(1) modulation ON and 0.394 with it OFF -- backwards. Must be recomputed on the excised tone-only series to isolate the modulation layer it was written to test.",
+    "C2.exists white level (178-198 Hz) is segment-sensitive: 6.45 vs 94.45 on two spans of the same Day20.8 recording. Upper bound is warn-only until a robust white-level estimator exists.",
+    "C3.width real max is 8.46 against a 9.0 bound -- only ~6% headroom, and it does not catch current v3 (7.96)."
+  ]
+}

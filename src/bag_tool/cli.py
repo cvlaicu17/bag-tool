@@ -24,6 +24,7 @@ from bag_tool.vib_check import run as run_vib_check
 from bag_tool.vib_verify import (run as run_vib_verify, measure_targets as vib_measure_targets,
                                  measure_harmonic_targets as vib_measure_harmonic_targets)
 from bag_tool.vib_state import run as run_vib_state
+from bag_tool.vib_realism import run as run_vib_realism
 from bag_tool.sim_check import run as run_sim_check
 from bag_tool.platforms import PLATFORMS, detect_from_bag, detect_from_bags
 
@@ -427,6 +428,26 @@ def main() -> None:
         help="After writing the JSON, also save it as bag-tool's default vib-fit-state "
              "coefficients")
 
+    # ---- vib-realism subcommand ----
+    vibrealism_parser = subparsers.add_parser(
+        "vib-realism",
+        help="Reference-free realism gate: does this bag vibrate the way real drones "
+             "vibrate? Structural invariants per layer (white/colored/tones/coupling), "
+             "no reference bag, no legacy flight phases.",
+    )
+    vibrealism_parser.add_argument("input_bag", help="Bag to check (.mcap file or directory)")
+    vibrealism_parser.add_argument("--imu-topic", default="/imu/data_raw",
+                                   help="IMU topic (default: /imu/data_raw)")
+    vibrealism_parser.add_argument("--gt-topic", default=None,
+                                   help="GT topic (default: auto-detect from known "
+                                        "platform topics; metrics degrade gracefully "
+                                        "with no GT at all)")
+    vibrealism_parser.add_argument("--profile", default=None, metavar="JSON",
+                                   help="Threshold overrides (keys of "
+                                        "vib_realism.DEFAULT_PROFILE)")
+    vibrealism_parser.add_argument("--json", default=None, metavar="FILE",
+                                   help="Also write the full result as JSON")
+
     # ---- vib-fit-harmonic-targets subcommand ----
     vibharm_parser = subparsers.add_parser(
         "vib-fit-harmonic-targets",
@@ -734,6 +755,10 @@ def main() -> None:
         if args.set_default:
             set_vib_state(out_path)
             print(f"Saved default vib-fit-state coefficients: {out_path}")
+
+    elif args.command == "vib-realism":
+        print()
+        raise SystemExit(run_vib_realism(args))
 
     elif args.command == "vib-fit-harmonic-targets":
         harmonics = None
