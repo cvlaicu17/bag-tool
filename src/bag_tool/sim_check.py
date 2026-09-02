@@ -134,6 +134,20 @@ def run(args) -> int:
         elif c["verdict"] == "warn":
             warns.append(f"vib:{c['id']}")
 
+    # ---- IMU signal-to-noise at a glance (the C7 rows above, restated) ----
+    c7 = {c["id"]: c for c in res["checks"] if c["id"].startswith("C7")}
+    snr, tot, inj = (c7.get(k, {}).get("value") for k in ("C7.snr", "C7.noise_eff", "C7.injected"))
+    if isinstance(snr, dict) and isinstance(tot, dict):
+        line = (f"  IMU SNR after 50 ms pre-integration: accel {snr['accel_db']:+.1f} dB, "
+                f"gyro {snr['gyro_db']:+.1f} dB   (real corpus -2.8..+7.0 / +13..+16)\n"
+                f"  surviving noise: total accel {tot['accel']:.3f} m/s², gyro {tot['gyro']:.4f} rad/s "
+                f"(real 0.09-0.22 / 0.014-0.028)")
+        if isinstance(inj, dict):
+            line += (f"\n  added by the vibration pass: accel {inj['accel']:.3f}, gyro {inj['gyro']:.4f} "
+                     f"-- bound = loudest real total 0.23 / 0.029")
+        print(line)
+    summary["imu_snr"] = {"snr": snr, "noise_eff": tot, "injected": inj}
+
     # ---- verdict ----
     print(SEP)
     summary["fails"] = fails
