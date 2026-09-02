@@ -59,14 +59,21 @@ def _report_topic(expectation: TopicExpectation, captured: dict, gap_mult: float
             "gaps": len(result.get("gaps", []))}
 
 
-def _check_depth_association(mono: list[int], depth: list[int]) -> tuple[bool, int, int]:
-    """Every mono capture must have one depth capture at the same stamp. The recorder
-    can legitimately emit an initial/final depth-only frame: reported, never a fail."""
+def _check_depth_association(mono: list[int], depth: list[int]) -> tuple[bool, int, int, int]:
+    """Every mono capture must have one depth capture at the same stamp, and vice
+    versa -- EXCEPT at the two ends: the recorder legitimately emits a leading/trailing
+    frame on one stream only when it starts or stops between the two captures
+    (fleet1/c03: one mono frame 53 ms after the last depth frame). Those are reported,
+    never a fail. An unpaired frame in the MIDDLE of the record is a fail.
+    Returns (paired, missing_mono_depth_inner, extra_depth, edge_unpaired)."""
     mono_counts = Counter(mono)
     depth_counts = Counter(depth)
-    missing_mono = sum((mono_counts - depth_counts).values())
+    missing = list((mono_counts - depth_counts).elements())
     extra_depth = sum((depth_counts - mono_counts).values())
-    return bool(mono) and missing_mono == 0, missing_mono, extra_depth
+    edge = {mono[0], mono[-1]} if mono else set()
+    inner = [t for t in missing if t not in edge]
+    edge_unpaired = len(missing) - len(inner)
+    return bool(mono) and not inner, len(inner), extra_depth, edge_unpaired
 
 
 def run(args) -> int:
@@ -91,13 +98,15 @@ def run(args) -> int:
             fails.append(f"cadence:{c['topic']}")
     mono = recorded[args.camera_topic]["stamp_times"] or recorded[args.camera_topic]["log_times"]
     depth = recorded[args.depth_topic]["stamp_times"] or recorded[args.depth_topic]["log_times"]
-    paired, mono_missing, depth_extra = _check_depth_association(mono, depth)
+    paired, mono_missing, depth_extra, edge_unpaired = _check_depth_association(mono, depth)
     print(f"  {'✔' if paired else '✘'} mono/depth association: {len(mono)} mono, {len(depth)} depth; "
-          f"missing mono->depth {mono_missing}, extra depth {depth_extra}")
+          f"unpaired mono inside the record {mono_missing}, extra depth {depth_extra}, "
+          f"unpaired at the record ends {edge_unpaired} (recorder start/stop, tolerated)")
     if not paired:
         fails.append("cadence:mono-depth-association")
     summary["sections"]["cadence"] = {"topics": cadence, "mono_depth_paired": paired,
-                                      "missing_mono_depth": mono_missing, "extra_depth": depth_extra}
+                                      "missing_mono_depth_inner": mono_missing,
+                                      "extra_depth": depth_extra, "edge_unpaired": edge_unpaired}
 
     # ---- 2. depth holes ----
     print(hdr(f"2. depth holes (landscape-seam dropouts, every {args.depth_stride} frame(s))"))
