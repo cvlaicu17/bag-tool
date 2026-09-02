@@ -681,14 +681,11 @@ def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = No
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
-def run(args) -> int:
-    profile = None
-    if getattr(args, "profile", None):
-        profile = json.load(open(args.profile))
-    raw = getattr(args, "raw", None) or guess_raw_bag(args.input_bag)
-    print(hdr(f"vib-realism: {args.input_bag}"))
-    res = analyze(args.input_bag, args.imu_topic, args.gt_topic, profile, raw)
+def print_report(res: dict, title: str | None = None) -> dict:
+    """Print the check table for an analyze() result; returns the verdict counts."""
     info = res["info"]
+    if title:
+        print(hdr(title))
     print(f"fs {info['fs']:.1f} Hz   gt {info.get('gt_topic') or 'NONE (energy-gated)'}   "
           f"active {info['active_s']:.0f}s   steady block {info['steady_s']:.0f}s   "
           f"main axis {info.get('main_accel_axis', '?')}   "
@@ -706,6 +703,16 @@ def run(args) -> int:
     verdict = ok if counts["fail"] == 0 else fail
     print(verdict(f"{counts['pass']} pass / {counts['warn']} warn / {counts['fail']} fail"
                   f" ({counts['report']} report-only, {counts['skip']} skipped)"))
+    return counts
+
+
+def run(args) -> int:
+    profile = None
+    if getattr(args, "profile", None):
+        profile = json.load(open(args.profile))
+    raw = getattr(args, "raw", None) or guess_raw_bag(args.input_bag)
+    res = analyze(args.input_bag, args.imu_topic, args.gt_topic, profile, raw)
+    counts = print_report(res, f"vib-realism: {args.input_bag}")
     if getattr(args, "json", None):
         with open(args.json, "w") as fh:
             json.dump(res, fh, indent=2)

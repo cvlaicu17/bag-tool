@@ -509,7 +509,8 @@ def main() -> None:
     # ---- sim-check subcommand ----
     simcheck_parser = subparsers.add_parser(
         "sim-check",
-        help="Validate a Project AirSim bag's GT/camera cadence and IMU vibrations.",
+        help="Validate a Project AirSim mission bag in one go: topic cadence, "
+             "depth-image seam holes, and the vibration realism gate. Exit 1 on any fail.",
     )
     simcheck_parser.add_argument("input_bag", help="PAS bag directory or .mcap file")
     simcheck_parser.add_argument("--imu-topic", default="/imu/data_raw",
@@ -540,6 +541,17 @@ def main() -> None:
                                  help="Fractional range cadence tolerance (default: 0.20)")
     simcheck_parser.add_argument("--gap-mult", type=float, default=3.0,
                                  help="Interval multiple considered a timestamp gap (default: 3)")
+    simcheck_parser.add_argument("--raw", default=None, metavar="BAG",
+                                 help="RAW (pre-vibration) bag for the < 5 Hz invariant; "
+                                      "auto-detected as <raw> for a <raw>_vib[_TAG] bag")
+    simcheck_parser.add_argument("--depth-stride", type=int, default=1, metavar="N",
+                                 help="Scan every N-th depth frame for seam holes (default: 1 = all)")
+    simcheck_parser.add_argument("--depth-limit", type=int, default=0, metavar="N",
+                                 help="Stop the hole scan after N scanned frames (default: 0 = all)")
+    simcheck_parser.add_argument("--skip-holes", action="store_true",
+                                 help="Skip the depth hole scan (cadence + vibration only)")
+    simcheck_parser.add_argument("--json", default=None, metavar="FILE",
+                                 help="Also write the full result as JSON")
 
     # ---- filter-imu subcommand ----
     filterimu_parser = subparsers.add_parser(
@@ -794,7 +806,7 @@ def main() -> None:
 
     elif args.command == "sim-check":
         print()
-        run_sim_check(args)
+        raise SystemExit(run_sim_check(args))
 
     elif args.command == "filter-imu":
         stores = detect_stores_enum()
