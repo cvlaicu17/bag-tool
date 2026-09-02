@@ -11,6 +11,18 @@ tier is the point: a mission is rejected only for things that mean "this bag is 
 never for texture a VIO estimator barely sees.
 
  FAIL   (gate)   -- C5.finite / C5.magnitude   values finite and physically representable
+                    C7.injected                the noise the vibration PASS added, as a VIO
+                                               estimator sees it: (vib - raw) above 5 Hz,
+                                               averaged over one 50 ms camera pre-integration
+                                               interval, RMS. Bounded by the loudest real
+                                               flight's TOTAL -- "did we add too much noise for
+                                               a trajectory to survive". Sim only (needs raw).
+                    C7.noise_eff (warn)        the same measure on the finished bag, real or
+                                               sim alike; on sim it includes the simulated
+                                               flight's own 5-15 Hz controller dynamics (raw
+                                               fleet1 bags already carry 0.17-0.34 m/s^2 of
+                                               it, the pass adds ~0.02) -- so it warns.
+                    C7.snr (report)            ratio to the 0.1-5 Hz body-motion signal, dB.
                     C5.level                   vibration-band energy inside the loose real
                                                corpus range: catches a forgotten or
                                                150x-too-quiet pass AND a runaway floor
@@ -106,6 +118,19 @@ DEFAULT_PROFILE = {
     # (C2.exists) flagged so unstably it had to be demoted.
     "band_std_accel": [0.35, 6.5],      # m/s^2  [real 1.15-2.12 | raw unvibed 0.11]
     "band_std_gyro":  [0.012, 0.18],    # rad/s  [real 0.040-0.060 | raw 0.006 | sim 0.037]
+    # C7: noise that survives a 50 ms pre-integration window (content > 5 Hz, box-
+    # averaged over preint_s, RMS over the airborne record).
+    #   real corpus TOTAL: accel 0.088-0.223 m/s^2, gyro 0.0135-0.0285 rad/s
+    #   fleet1 sim TOTAL:  accel 0.19-0.35 (raw flight alone 0.17-0.34!), gyro 0.012
+    #   fleet1 sim INJECTED by the pass: accel 0.079-0.090, gyro 0.0105-0.0112
+    # FAIL if what the pass ADDED exceeds the loudest real flight's total (1.0x);
+    # WARN if the finished bag's total exceeds 1.5x it -- on sim that excess is the
+    # simulated flight controller's own 5-15 Hz activity, not the vibration pass.
+    "preint_s": 0.05,
+    "injected_accel_max": 0.23,       # m/s^2   (fail tier, sim only)
+    "injected_gyro_max": 0.029,       # rad/s
+    "noise_eff_accel_max": 0.34,      # m/s^2   (warn tier, real and sim)
+    "noise_eff_gyro_max": 0.043,      # rad/s
     # injected 0.05-4.5 Hz RMS relative to the finished bag's own white-noise RMS in
     # that band (its 178-198 Hz density). Sim only. NOT relative to the raw bag's
     # dynamics: the sim flies laterally far smoother than any real aircraft, so a
@@ -144,7 +169,8 @@ DEFAULT_PROFILE = {
 # "report" checks are never scored at all (their value is printed with the range).
 TIER = {
     "C5.finite": "fail", "C5.magnitude": "fail", "C5.level": "fail",
-    "C5.lowband": "fail", "SEG": "fail",
+    "C5.lowband": "fail", "C7.injected": "fail", "SEG": "fail",
+    "C7.noise_eff": "warn", "C7.snr": "report",
     "C3.exist": "warn", "C2.gaussian": "warn", "C2.breathe": "warn", "C3.width": "warn",
     "C3.responsive": "warn", "C4.contrast": "warn",
     "C1.white_flat": "report", "C1.white_level": "report", "C1.white_level_gyro": "report",
@@ -466,51 +492,106 @@ def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = No
         add("C5.level", "vibration-band energy inside the real corpus range", None, "skip",
             "no airborne record")
 
+    # ---- raw (pre-vibration) bag, sim only: shared by C7.injected and C5.lowband ----
+    racc = rgyr = None
+    raw_note = None
+    if raw_bag:
+        try:
+            rt, racc, rgyr = _read_imu_only(raw_bag, imu_topic)
+            if len(rt) != len(ti):
+                raw_note = (f"IMU message counts differ (raw {len(rt)}, vib {len(ti)}) -- "
+                            "not the same flight, cannot align")
+                racc = rgyr = None
+        except Exception as e:  # unreadable raw is a skip, not a verdict
+            raw_note = f"raw bag unreadable: {e}"
+    else:
+        raw_note = "no raw bag (real recording, or pass --raw)"
+
+    # ---- C7: signal-to-noise as the estimator sees it (real and sim alike) ----
+    # signal = 0.1-5 Hz body motion; noise = > 5 Hz content after the same 50 ms box
+    # average a 20 Hz camera pre-integration applies (sinc^2 weighting: a 43 Hz tone is
+    # cut ~15x, the 5-15 Hz floor passes almost whole -- that is what a trajectory feels).
+    # With the raw bag, the same measure on (vib - raw) isolates what the vibration PASS
+    # added -- the direct answer to "did we add too much". Measured on fleet1: the raw
+    # simulated flight already carries 0.17-0.34 m/s^2 of this noise from its own 5-15 Hz
+    # controller dynamics, and the pass adds ~0.01-0.02 on top.
+    if active.sum() > fs * 10:
+        N = len(ti)
+        fr = np.fft.rfftfreq(N, d=1.0 / fs)
+        nbox = max(1, int(round(P["preint_s"] * fs)))
+        box = np.ones(nbox) / nbox
+        hi_sel = fr > 5.0
+        sig_sel = (fr >= 0.1) & (fr <= 5.0)
+
+        def _eff(x):
+            X = np.fft.rfft(x - x.mean())
+            hi = np.fft.irfft(np.where(hi_sel, X, 0), n=N)
+            return float(np.convolve(hi, box, mode="same")[active].std())
+
+        def _sig(x):
+            X = np.fft.rfft(x - x.mean())
+            return float(np.fft.irfft(np.where(sig_sel, X, 0), n=N)[active].std())
+
+        tot, sig, inj = {}, {}, {}
+        for lbl, V, R in (("accel", acc, racc), ("gyro", gyr, rgyr)):
+            tot[lbl] = max(_eff(V[:, j]) for j in range(3))
+            sig[lbl] = float(np.sqrt(np.mean([_sig(V[:, j]) ** 2 for j in range(3)])))
+            if R is not None:
+                inj[lbl] = max(_eff(V[:, j] - R[:, j]) for j in range(3))
+        add("C7.noise_eff", "noise surviving a 50 ms pre-integration window",
+            {"accel": round(tot["accel"], 4), "gyro": round(tot["gyro"], 5)},
+            tot["accel"] <= P["noise_eff_accel_max"] and tot["gyro"] <= P["noise_eff_gyro_max"],
+            "louder than every real flight the estimator copes with; on a sim bag this "
+            "includes the simulated flight's own 5-15 Hz controller dynamics (see "
+            "C7.injected for the vibration pass's share)")
+        if inj:
+            add("C7.injected", "pre-integration noise ADDED by the vibration pass",
+                {"accel": round(inj["accel"], 4), "gyro": round(inj["gyro"], 5)},
+                inj["accel"] <= P["injected_accel_max"] and inj["gyro"] <= P["injected_gyro_max"],
+                "the pass alone adds more surviving noise than the loudest real flight "
+                "carries in total -- too much for a trajectory")
+        else:
+            add("C7.injected", "pre-integration noise ADDED by the vibration pass", None,
+                "skip", raw_note or "")
+        add("C7.snr", "signal-to-noise after pre-integration (dB)",
+            {"accel_db": round(float(20 * np.log10(max(sig["accel"], 1e-12) / max(tot["accel"], 1e-12))), 1),
+             "gyro_db": round(float(20 * np.log10(max(sig["gyro"], 1e-12) / max(tot["gyro"], 1e-12))), 1),
+             "signal_accel": round(sig["accel"], 3), "signal_gyro": round(sig["gyro"], 4)},
+            True, "signal depends on how the flight was flown (a gentle sim route has "
+                  "less of it), so the ratio informs and C7.injected gates")
+    else:
+        add("C7.noise_eff", "noise surviving a 50 ms pre-integration window", None, "skip",
+            "no airborne record")
+
     # ---- C5.lowband: the truth band must be untouched (sim only, needs the raw bag) --
     # VIO integrates the < 5 Hz content as the actual motion. The vibration pass is
     # additive and by construction writes nothing there (L2 zeroes < 5 Hz, tones sit at
     # >= 20 Hz aliased); this measures that it really didn't -- on the actual output.
-    if raw_bag:
-        try:
-            rt, racc, rgyr = _read_imu_only(raw_bag, imu_topic)
-        except Exception as e:  # unreadable raw is a skip, not a verdict
-            rt = None
-            add("C5.lowband", "< 5 Hz body-dynamics band untouched vs raw", None, "skip",
-                f"raw bag unreadable: {e}")
-        if rt is not None:
-            if len(rt) != len(ti):
-                add("C5.lowband", "< 5 Hz body-dynamics band untouched vs raw",
-                    {"raw_msgs": int(len(rt)), "vib_msgs": int(len(ti))}, "skip",
-                    "IMU message counts differ -- not the same flight, cannot align")
-            else:
-                # brick-wall band energies from a long-window PSD (a 4th-order
-                # Butterworth "5 Hz lowpass" let the injected 5-10 Hz floor through
-                # its skirt and dominated the number)
-                lo_b, hi_b = 0.05, 4.5
-                leaks = {}
-                for lbl, V, R in (("accel", acc, racc), ("gyro", gyr, rgyr)):
-                    for j, ax in enumerate("xyz"):
-                        d = V[:, j] - R[:, j]
-                        fw, pdiff = welch(d - d.mean(), fs=fs, nperseg=16384)
-                        _, praw = welch(R[:, j] - R[:, j].mean(), fs=fs, nperseg=16384)
-                        b = (fw >= lo_b) & (fw <= hi_b)
-                        inj = float(np.sqrt(np.trapezoid(pdiff[b], fw[b])))
-                        # the hiss the estimator actually sees is the FINISHED bag's
-                        # high-band level (the pass tops the sim's own L4 up to the
-                        # real floor), not the raw sim's, which can sit far below it
-                        _, pvib = welch(V[:, j] - V[:, j].mean(), fs=fs, nperseg=16384)
-                        wb = (fw >= 178) & (fw <= 198)
-                        hiss = float(np.sqrt(np.median(pvib[wb]) * (hi_b - lo_b)))
-                        leaks[f"{lbl}_{ax}"] = inj / max(hiss, 1e-15)
-                worst = max(leaks, key=leaks.get)
-                add("C5.lowband", "< 5 Hz body-dynamics band untouched vs raw",
-                    {"worst": f"{worst}={leaks[worst]:.3f}"},
-                    leaks[worst] <= P["lowband_leak_max"],
-                    "injected 0.05-4.5 Hz RMS over the sensor's own white-noise RMS in "
-                    "that band; the pass must not write into the band VIO treats as truth")
+    if racc is not None:
+        # brick-wall band energies from a long-window PSD (a 4th-order Butterworth
+        # "5 Hz lowpass" let the injected 5-10 Hz floor through its skirt)
+        lo_b, hi_b = 0.05, 4.5
+        leaks = {}
+        for lbl, V, R in (("accel", acc, racc), ("gyro", gyr, rgyr)):
+            for j, ax in enumerate("xyz"):
+                d = V[:, j] - R[:, j]
+                fw, pdiff = welch(d - d.mean(), fs=fs, nperseg=16384)
+                # the hiss the estimator actually sees is the FINISHED bag's high-band
+                # level (the pass tops the sim's own L4 up to the real floor)
+                _, pvib = welch(V[:, j] - V[:, j].mean(), fs=fs, nperseg=16384)
+                b = (fw >= lo_b) & (fw <= hi_b)
+                inj_rms = float(np.sqrt(np.trapezoid(pdiff[b], fw[b])))
+                wb = (fw >= 178) & (fw <= 198)
+                hiss = float(np.sqrt(np.median(pvib[wb]) * (hi_b - lo_b)))
+                leaks[f"{lbl}_{ax}"] = inj_rms / max(hiss, 1e-15)
+        worst = max(leaks, key=leaks.get)
+        add("C5.lowband", "< 5 Hz body-dynamics band untouched vs raw",
+            {"worst": f"{worst}={leaks[worst]:.3f}"},
+            leaks[worst] <= P["lowband_leak_max"],
+            "injected 0.05-4.5 Hz RMS over the sensor's own white-noise RMS in "
+            "that band; the pass must not write into the band VIO treats as truth")
     else:
-        add("C5.lowband", "< 5 Hz body-dynamics band untouched vs raw", None, "skip",
-            "no raw bag (real recording, or pass --raw)")
+        add("C5.lowband", "< 5 Hz body-dynamics band untouched vs raw", None, "skip", raw_note)
 
     if steady is None:
         add("SEG", "steady analysis block", None, False,

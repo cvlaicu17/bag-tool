@@ -1,7 +1,7 @@
 {
- "generated": "2026-09-02T13:21:01+03:00",
- "bag_tool_commit": "ffc2168",
- "note": "Trimmed gate (three tiers). Rule: every real bag passes the FAIL tier with zero warns. FAIL = C5.finite/magnitude/level/lowband + SEG; WARN = C3.exist/width/responsive, C2.gaussian/breathe, C4.contrast; the rest report-only. The earlier C0.shaft_steady check and its downstream-annotation logic were removed: it compared the sim's rotor sidecar against a real-aircraft spread that cannot be measured without motor telemetry (the '7-70x' figure compared a whole-mission p5-p95 against a 60 s line width; like for like the real shaft moves ~4% over a mission vs the sim's 16% instantaneous / ~6% at 1 s smoothing), and add_vibration.py now phase-integrates the 1 s-smoothed shaft. Known cosmetic: on PAS bags the census can lock onto the simulator's own narrow 23-27 Hz line (present in the RAW bag at ~7 dB, a tenth of a tone's energy), so C3.exist/width/contrast on fleet bags may describe that line rather than the 1x tone at ~43 Hz; they are warn/report tier for that reason. Line width on fleet bags (~10-13 Hz after smoothing) is slow tens-of-seconds throttle motion of the simulated aircraft, not chatter; accepted as a warn.",
+ "generated": "2026-09-02T18:32:33+03:00",
+ "bag_tool_commit": "34ef2a5",
+ "note": "Trimmed gate (three tiers) + C7 SNR. C7.injected (fail, sim only) = pre-integration noise the vibration pass ADDED, bounded by the loudest real flight total; C7.noise_eff (warn) = total; C7.snr report. Raw fleet1 flights already carry 0.17-0.34 m/s^2 of surviving noise from the simulated controller, the pass adds ~0.08. Rule: every real bag passes the FAIL tier with zero warns. FAIL = C5.finite/magnitude/level/lowband + SEG; WARN = C3.exist/width/responsive, C2.gaussian/breathe, C4.contrast; the rest report-only. The earlier C0.shaft_steady check and its downstream-annotation logic were removed: it compared the sim's rotor sidecar against a real-aircraft spread that cannot be measured without motor telemetry (the '7-70x' figure compared a whole-mission p5-p95 against a 60 s line width; like for like the real shaft moves ~4% over a mission vs the sim's 16% instantaneous / ~6% at 1 s smoothing), and add_vibration.py now phase-integrates the 1 s-smoothed shaft. Known cosmetic: on PAS bags the census can lock onto the simulator's own narrow 23-27 Hz line (present in the RAW bag at ~7 dB, a tenth of a tone's energy), so C3.exist/width/contrast on fleet bags may describe that line rather than the 1x tone at ~43 Hz; they are warn/report tier for that reason. Line width on fleet bags (~10-13 Hz after smoothing) is slow tens-of-seconds throttle motion of the simulated aircraft, not chatter; accepted as a warn.",
  "corpus": {
   "real_bags_local_jazzy": [
    "Day20.1",
@@ -23,7 +23,10 @@
   "C5.magnitude": "fail",
   "C5.level": "fail",
   "C5.lowband": "fail",
+  "C7.injected": "fail",
   "SEG": "fail",
+  "C7.noise_eff": "warn",
+  "C7.snr": "report",
   "C3.exist": "warn",
   "C2.gaussian": "warn",
   "C2.breathe": "warn",
@@ -51,6 +54,11 @@
    0.012,
    0.18
   ],
+  "preint_s": 0.05,
+  "injected_accel_max": 0.23,
+  "injected_gyro_max": 0.029,
+  "noise_eff_accel_max": 0.34,
+  "noise_eff_gyro_max": 0.043,
   "lowband_leak_max": 0.5,
   "lines_min_prom_db": 3.5,
   "lines_min_count": 5,
@@ -377,6 +385,85 @@
    "controls": {
     "d01_smoothed_envlp": -0.01,
     "d01_raw_unvibed": 0.22
+   }
+  },
+  "C7.noise_eff.accel": {
+   "real": [
+    0.0877,
+    0.2229
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 0.1896,
+    "d01_raw_unvibed": 0.1702,
+    "d02_vib_352899c": 0.1919,
+    "c02_vib_352899c": 0.3536,
+    "c02_raw_unvibed": 0.3443
+   }
+  },
+  "C7.noise_eff.gyro": {
+   "real": [
+    0.0135,
+    0.0284
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 0.0123,
+    "d01_raw_unvibed": 0.0071
+   }
+  },
+  "C7.snr.accel_db": {
+   "real": [
+    -2.8,
+    7.0
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 6.8,
+    "d01_raw_unvibed": 7.7
+   }
+  },
+  "C7.snr.gyro_db": {
+   "real": [
+    13.3,
+    16.3
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 21.4,
+    "d01_raw_unvibed": 26.2
+   }
+  },
+  "C7.snr.signal_accel": {
+   "real": [
+    0.117,
+    0.501
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 0.413,
+    "d01_raw_unvibed": 0.413
+   }
+  },
+  "C7.snr.signal_gyro": {
+   "real": [
+    0.0766,
+    0.1584
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 0.144,
+    "d01_raw_unvibed": 0.144
+   }
+  },
+  "C7.injected.accel": {
+   "real": null,
+   "controls": {
+    "d01_vib_352899c": 0.0845,
+    "d02_vib_352899c": 0.0904,
+    "c02_vib_352899c": 0.0787
+   }
+  },
+  "C7.injected.gyro": {
+   "real": null,
+   "controls": {
+    "d01_vib_352899c": 0.01123,
+    "d02_vib_352899c": 0.01047,
+    "c02_vib_352899c": 0.01055
    }
   }
  }
