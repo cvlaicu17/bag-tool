@@ -448,10 +448,10 @@ def main() -> None:
     vibrealism_parser.add_argument("--json", default=None, metavar="FILE",
                                    help="Also write the full result as JSON")
     vibrealism_parser.add_argument(
-        "--rotor-npz", default=None, metavar="NPZ",
-        help="Rotor-speed sidecar (<bag>_rotor_states.npz) for the C0 shaft-steadiness "
-             "check, which attributes a smeared tone to the SIM'S OWN throttle activity "
-             "rather than to the vibration pass. Auto-detected beside the bag if present.")
+        "--raw", default=None, metavar="BAG",
+        help="The RAW (pre-vibration) bag this output was generated from, for the "
+             "C5.lowband invariant (the < 5 Hz body-dynamics band must be untouched). "
+             "Auto-detected as <raw> for a <raw>_vib[_TAG] bag; skipped when absent.")
 
     # ---- vib-fit-harmonic-targets subcommand ----
     vibharm_parser = subparsers.add_parser(

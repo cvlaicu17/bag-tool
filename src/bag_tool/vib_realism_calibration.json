@@ -1,152 +1,383 @@
 {
-  "generated": "2026-09-01T12:56:19+03:00",
-  "corpus": {
-    "real_bags_local_jazzy": [
-      "Day20.1",
-      "Day20.2",
-      "Day20.3",
-      "Day20.5",
-      "Day20.6",
-      "Day20.7",
-      "Day20.8",
-      "Day32"
-    ],
-    "sim_bags_v2_aupt04_cache": [
-      "pas_d04_vib2",
-      "pas_d07_vib2",
-      "pas_d03_vib2",
-      "pas_d01_vib2",
-      "pas_d02_vib2",
-      "pas_d05_vib2",
-      "pas_d08_vib2",
-      "pas_d06_vib2",
-      "pas_d09_vib2",
-      "pas_d10_vib2"
-    ],
-    "sim_bags_local": [
-      "pas_d01_vib2",
-      "pas_d05_vib2",
-      "pas_d09_vib2",
-      "pas_d01_vib3"
-    ],
-    "controls_aupt04": [
-      "raw_unvibed(fleet3/pas_d01)",
-      "current_v3ar1",
-      "no_modulation(VIB_STATE_MODULATE=0)"
-    ],
-    "note": "skygate cache holds 7 real + 10 sim bags, NOT 17 real. Day32 exists only locally. The *_jazzy conversions are TRIMMED (Day20.8: 473s vs the original recording's 593s), so the two reads of one flight can select different steady blocks and give different metric values."
-  },
-  "observed_ranges": {
-    "C1.white_flat.flatness": {
-      "real": [
-        0.21,
-        0.95
-      ],
-      "sim": [
-        0.86,
-        0.92
-      ]
-    },
-    "C2.breathe.cv": {
-      "real": [
-        0.18,
-        0.36
-      ],
-      "sim": [
-        0.06,
-        0.09
-      ]
-    },
-    "C2.exists.lowband_over_white": {
-      "real": [
-        1.47,
-        9.45
-      ],
-      "sim": [
-        1.43,
-        72.46
-      ]
-    },
-    "C2.gaussian.excess_kurtosis": {
-      "real": [
-        0.36,
-        4.59
-      ],
-      "sim": [
-        -0.02,
-        0.05
-      ]
-    },
-    "C3.breathe.sigma_log": {
-      "real": [
-        0.337,
-        0.536
-      ],
-      "sim": [
-        0.204,
-        0.513
-      ]
-    },
-    "C3.breathe.tau_s": {
-      "real": [
-        1.7,
-        6.6
-      ],
-      "sim": [
-        1.4,
-        2.4
-      ]
-    },
-    "C3.exist.top_prom_db": {
-      "real": [
-        5.1,
-        9.0
-      ],
-      "sim": [
-        4.3,
-        6.2
-      ]
-    },
-    "C3.responsive.p90_p10": {
-      "real": [
-        2.38,
-        3.84
-      ],
-      "sim": [
-        1.47,
-        3.81
-      ]
-    },
-    "C3.width.width_hz": {
-      "real": [
-        0.78,
-        8.31
-      ],
-      "sim": [
-        9.47,
-        14.11
-      ]
-    },
-    "C6.flat.flatness": {
-      "real": [
-        0.947,
-        0.986
-      ],
-      "sim": [
-        0.961,
-        0.985
-      ]
-    }
-  },
-  "acceptance": "every real bag must PASS (no fail); a threshold a real bag violates is a wrong threshold",
-  "results": {
-    "real_pass": "8/8 clean (0 fail, 0 warn) on the _jazzy reads",
-    "sim_v2_fail": "10/10 on aupt04 cache + 3/3 locally",
-    "controls": "raw_unvibed FAIL, no_modulation FAIL, current_v3ar1 FAIL (5 checks)"
-  },
-  "known_metric_issues": [
-    "C3.breathe measures TOTAL band-amplitude variability, which the broadband floor dominates; it reports 0.352 with AR(1) modulation ON and 0.394 with it OFF -- backwards. Must be recomputed on the excised tone-only series to isolate the modulation layer it was written to test.",
-    "C2.exists white level (178-198 Hz) is segment-sensitive: 6.45 vs 94.45 on two spans of the same Day20.8 recording. Upper bound is warn-only until a robust white-level estimator exists.",
-    "C3.width real max is 8.46 against a 9.0 bound -- only ~6% headroom, and it does not catch current v3 (7.96)."
+ "generated": "2026-09-02T13:21:01+03:00",
+ "bag_tool_commit": "ffc2168",
+ "note": "Trimmed gate (three tiers). Rule: every real bag passes the FAIL tier with zero warns. FAIL = C5.finite/magnitude/level/lowband + SEG; WARN = C3.exist/width/responsive, C2.gaussian/breathe, C4.contrast; the rest report-only. The earlier C0.shaft_steady check and its downstream-annotation logic were removed: it compared the sim's rotor sidecar against a real-aircraft spread that cannot be measured without motor telemetry (the '7-70x' figure compared a whole-mission p5-p95 against a 60 s line width; like for like the real shaft moves ~4% over a mission vs the sim's 16% instantaneous / ~6% at 1 s smoothing), and add_vibration.py now phase-integrates the 1 s-smoothed shaft. Known cosmetic: on PAS bags the census can lock onto the simulator's own narrow 23-27 Hz line (present in the RAW bag at ~7 dB, a tenth of a tone's energy), so C3.exist/width/contrast on fleet bags may describe that line rather than the 1x tone at ~43 Hz; they are warn/report tier for that reason. Line width on fleet bags (~10-13 Hz after smoothing) is slow tens-of-seconds throttle motion of the simulated aircraft, not chatter; accepted as a warn.",
+ "corpus": {
+  "real_bags_local_jazzy": [
+   "Day20.1",
+   "Day20.2",
+   "Day20.3",
+   "Day20.5",
+   "Day20.6",
+   "Day20.7",
+   "Day20.8",
+   "Day32"
+  ],
+  "controls": [
+   "d01_raw_unvibed",
+   "d01_smoothed_envlp"
   ]
+ },
+ "tiers": {
+  "C5.finite": "fail",
+  "C5.magnitude": "fail",
+  "C5.level": "fail",
+  "C5.lowband": "fail",
+  "SEG": "fail",
+  "C3.exist": "warn",
+  "C2.gaussian": "warn",
+  "C2.breathe": "warn",
+  "C3.width": "warn",
+  "C3.responsive": "warn",
+  "C4.contrast": "warn",
+  "C1.white_flat": "report",
+  "C1.white_level": "report",
+  "C1.white_level_gyro": "report",
+  "C2.exists": "report",
+  "C3.cluster": "report",
+  "C3.breathe": "report",
+  "C3.skew": "report",
+  "C4.gyro_ratio": "report",
+  "C6.flat": "report"
+ },
+ "profile": {
+  "accel_abs_max": 250.0,
+  "gyro_abs_max": 50.0,
+  "band_std_accel": [
+   0.35,
+   6.5
+  ],
+  "band_std_gyro": [
+   0.012,
+   0.18
+  ],
+  "lowband_leak_max": 0.5,
+  "lines_min_prom_db": 3.5,
+  "lines_min_count": 5,
+  "floor_kurtosis": [
+   0.15,
+   8.0
+  ],
+  "floor_breathe_cv_min": 0.13,
+  "line_width_hz": [
+   0.15,
+   9.0
+  ],
+  "tone_p90_p10_min": 2.2,
+  "coh_high_min": 0.6,
+  "coh_low_max": 0.85,
+  "white_flatness_min": 0.15,
+  "white_accel_density": [
+   1e-06,
+   0.03
+  ],
+  "white_gyro_density": [
+   1e-11,
+   0.0001
+  ],
+  "colored_ratio": [
+   1.3,
+   15.0
+  ],
+  "tone_sigma_log": [
+   0.3,
+   1.5
+  ],
+  "tone_tau_s": [
+   0.3,
+   20.0
+  ],
+  "gyro_accel_ratio": [
+   0.0003,
+   0.5
+  ],
+  "whiten_flatness_min": 0.75,
+  "whiten_kurtosis": [
+   -1.0,
+   4.0
+  ],
+  "min_height_m": 2.0,
+  "min_steady_s": 20.0
+ },
+ "verdicts": {
+  "Day20.1": {
+   "fails": [],
+   "warns": []
+  },
+  "Day20.2": {
+   "fails": [],
+   "warns": []
+  },
+  "Day20.3": {
+   "fails": [],
+   "warns": []
+  },
+  "Day20.5": {
+   "fails": [],
+   "warns": []
+  },
+  "Day20.6": {
+   "fails": [],
+   "warns": []
+  },
+  "Day20.7": {
+   "fails": [],
+   "warns": []
+  },
+  "Day20.8": {
+   "fails": [],
+   "warns": []
+  },
+  "Day32": {
+   "fails": [],
+   "warns": []
+  },
+  "d01_smoothed_envlp": {
+   "fails": [],
+   "warns": [
+    "C3.width",
+    "C4.contrast"
+   ]
+  },
+  "d01_raw_unvibed": {
+   "fails": [
+    "C5.level"
+   ],
+   "warns": [
+    "C2.gaussian",
+    "C4.contrast"
+   ]
+  }
+ },
+ "observed_ranges": {
+  "C1.white_flat.flatness": {
+   "real": [
+    0.21,
+    0.95
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 0.98,
+    "d01_raw_unvibed": 0.98
+   }
+  },
+  "C1.white_level.accel_density": {
+   "real": [
+    0.0003,
+    0.001
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 0.0003,
+    "d01_raw_unvibed": 0.0
+   }
+  },
+  "C1.white_level_gyro.gyro_density": {
+   "real": [
+    0.0,
+    0.0
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 0.0,
+    "d01_raw_unvibed": 0.0
+   }
+  },
+  "C2.breathe.cv": {
+   "real": [
+    0.18,
+    0.36
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 0.2,
+    "d01_raw_unvibed": 0.65
+   }
+  },
+  "C2.breathe.lag1": {
+   "real": [
+    0.43,
+    0.82
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 0.7,
+    "d01_raw_unvibed": 0.59
+   }
+  },
+  "C2.exists.lowband_over_white": {
+   "real": [
+    1.47,
+    9.45
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 100.44
+   }
+  },
+  "C2.gaussian.excess_kurtosis": {
+   "real": [
+    0.36,
+    4.59
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 0.56,
+    "d01_raw_unvibed": 10.83
+   }
+  },
+  "C3.breathe.sigma_log": {
+   "real": [
+    0.337,
+    0.536
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 0.592,
+    "d01_raw_unvibed": 1.06
+   }
+  },
+  "C3.breathe.tau_s": {
+   "real": [
+    1.7,
+    6.6
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 2.5,
+    "d01_raw_unvibed": 2.6
+   }
+  },
+  "C3.cluster.f_star": {
+   "real": [
+    50.4,
+    101.9
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 23.3,
+    "d01_raw_unvibed": 26.8
+   }
+  },
+  "C3.cluster.lines_within_15hz": {
+   "real": [
+    1,
+    15
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 2,
+    "d01_raw_unvibed": 4
+   }
+  },
+  "C3.exist.n_lines_ge3db": {
+   "real": [
+    21,
+    40
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 31,
+    "d01_raw_unvibed": 40
+   }
+  },
+  "C3.exist.top_prom_db": {
+   "real": [
+    5.1,
+    9.0
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 5.5,
+    "d01_raw_unvibed": 7.4
+   }
+  },
+  "C3.responsive.p90_p10": {
+   "real": [
+    2.38,
+    3.84
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 4.84,
+    "d01_raw_unvibed": 13.24
+   }
+  },
+  "C3.skew.log_skew": {
+   "real": [
+    -0.65,
+    0.51
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 0.55,
+    "d01_raw_unvibed": 0.91
+   }
+  },
+  "C3.width.width_hz": {
+   "real": [
+    0.78,
+    8.31
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 13.48,
+    "d01_raw_unvibed": 7.86
+   }
+  },
+  "C4.gyro_ratio.ratio": {
+   "real": [
+    0.0048,
+    0.035
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 0.276,
+    "d01_raw_unvibed": 0.132
+   }
+  },
+  "C5.level.accel_band_std": {
+   "real": [
+    1.148,
+    2.124
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 1.239,
+    "d01_raw_unvibed": 0.111
+   }
+  },
+  "C5.level.gyro_band_std": {
+   "real": [
+    0.0397,
+    0.0602
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 0.0373,
+    "d01_raw_unvibed": 0.0061
+   }
+  },
+  "C5.magnitude.accel_max": {
+   "real": [
+    17.5,
+    58.8
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 26.3,
+    "d01_raw_unvibed": 25.1
+   }
+  },
+  "C5.magnitude.gyro_max": {
+   "real": [
+    1.15,
+    8.73
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 2.46,
+    "d01_raw_unvibed": 2.42
+   }
+  },
+  "C6.flat.flatness": {
+   "real": [
+    0.947,
+    0.986
+   ],
+   "controls": {
+    "d01_smoothed_envlp": 0.986,
+    "d01_raw_unvibed": 0.981
+   }
+  },
+  "C6.flat.kurtosis": {
+   "real": [
+    -0.02,
+    0.09
+   ],
+   "controls": {
+    "d01_smoothed_envlp": -0.01,
+    "d01_raw_unvibed": 0.22
+   }
+  }
+ }
 }

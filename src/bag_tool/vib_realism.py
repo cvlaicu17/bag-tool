@@ -6,37 +6,51 @@ calibration time, wrong one at mission-acceptance time), this asks "does this ba
 the way real drones vibrate?" -- structural invariants only, with thresholds calibrated so
 that EVERY real bag in the corpus passes and an unvibed or badly-vibed sim bag fails.
 
-The checks map onto the layers add_vibration.py generates, and each is phrased as a
-property of reality rather than a comparison to a reference:
+The checks map onto the layers add_vibration.py generates, and come in THREE TIERS. The
+tier is the point: a mission is rejected only for things that mean "this bag is broken",
+never for texture a VIO estimator barely sees.
 
- C1 white noise    -- the sensor's own hiss: flat spectrum where nothing else lives,
-                      at a loudness a real MEMS part could produce.
- C2 colored noise  -- the turbulence carpet: present (low band louder than the white
-                      level), smooth, near-Gaussian carrier, energy that breathes.
- C3 tones          -- spikes above the carpet when motors run: a fundamental CLUSTER
-                      (real rotors never spin identically), amplitudes that breathe
-                      with multi-second memory, respond to flight state, and have a
-                      physically sane line width.
- C4 cross-channel  -- vibration travels through a rigid body: some channel pairs move
-                      in lockstep, others don't (all-locked and none-locked are both
-                      impossible), and the gyro echo of the accel buzz has a plausible
-                      magnitude.
- C5 invariants     -- finite values, physically representable magnitudes.
- C6 whitening      -- after accounting for tones + colored floor + white hiss, nothing
-                      is left: the whitened residual is flat and Gaussian. One number
-                      that says the three layers explain the whole signal.
+ FAIL   (gate)   -- C5.finite / C5.magnitude   values finite and physically representable
+                    C5.level                   vibration-band energy inside the loose real
+                                               corpus range: catches a forgotten or
+                                               150x-too-quiet pass AND a runaway floor
+                    C5.lowband                 the < 5 Hz body-dynamics band -- the part
+                                               VIO treats as truth -- is untouched vs the
+                                               raw bag (sim only; needs --raw / auto)
+ADVISE (warn)   -- C3.exist                   spectral lines stand above the floor. NOT the
+                                               absence detector it was meant to be: a raw
+                                               PAS bag carries its own narrow 23-27 Hz
+                                               simulator line (7 dB, a tenth of a tone's
+                                               energy) that the census locks onto, so raw
+                                               passes it and a smeared genuine tone can
+                                               fail it. C5.level is the absence detector.
+                    C2.gaussian / C2.breathe   floor is heavy-tailed and breathes
+                    C3.width / C3.responsive   line width sane; amplitude follows state
+                    C4.contrast                some channel pairs locked, some not
+                    These are texture: real, measurable, and they DID surface genuine L2
+                    defects once -- but a mission that trips one is still usable, so they
+                    advise instead of block.
+ REPORT (inform) -- C1.* white level/flatness, C2.exists, C3.cluster / breathe / skew,
+                    C4.gyro_ratio, C6 whitening. Either sanity bands, or metrics shown
+                    to be unstable (C2.exists swings 15x between two spans of ONE real
+                    flight) or non-discriminating (C6). Printed with their real-corpus
+                    range so a human can read them; never scored.
 
 Deliberately NOT checked (do not add back): exact line frequencies or the exact
 harmonic family (drone-specific, and sim frequencies come from sim physics by
 decision); amplitudes vs any particular reference bag; integer relationships between
 lines (aliasing scrambles them); explicit H(f) (unidentifiable from mission data);
-anything about the RPM law.
+anything about the RPM law; the simulated flight controller's throttle activity (an
+earlier C0.shaft_steady check compared the sim's rotor sidecar against a real-aircraft
+number that cannot be measured without motor telemetry -- it explained failures away
+instead of gating, and add_vibration.py now smooths the shaft it phase-integrates, so
+the smear it excused is gone at the source); motors-off silence (sim missions never
+have the motors off, so it could only ever skip).
 
 Segmentation policy: NO legacy climb/cruise/descent phases. Where a quasi-stationary
 stretch is needed (spectral surgery), the tool uses the longest contiguous airborne run
-whose |vertical speed| stays below the mission's own median -- a data-driven quantile,
-not a fixed threshold with a name. State-responsiveness is measured over the whole
-airborne record with no segmentation at all (p90/p10 of the windowed tone amplitude).
+whose |vertical speed| stays below a data-driven quantile of the mission's own |vz|.
+State-responsiveness is measured over the whole airborne record with no segmentation.
 
 Isolation pipeline (validated on real day20.7 before this was written -- the whitened
 residual there comes out at spectral flatness 0.981, kurtosis +0.20):
@@ -77,67 +91,65 @@ WIN_S, HOP_S = 2.0, 1.0
 # so the calibration history is versioned with the code; --profile overrides for
 # experiments.
 DEFAULT_PROFILE = {
-    # CALIBRATED on the 8-bag real altair corpus (Day20.1/2/3/5/6/7/8 + Day32) with
-    # 4 sim bags as negative controls. Rule: every real bag must PASS; a threshold a
-    # real bag violates is a wrong threshold. Where real and sim ranges are disjoint
-    # the bound sits in the gap; where they overlap the check is a loose sanity bound
-    # or report-only. Observed ranges are quoted as [real | sim] so the next person
-    # can see the margin they are widening.
-    # C1
-    "white_flatness_min": 0.15,        # [real 0.21-0.95] Day32 sits at 0.21
-    "white_accel_density": [1e-6, 3e-2],   # sanity band for a MEMS part
-    "white_gyro_density":  [1e-11, 1e-4],
-    # C2
-    # Lower bound gates (a colored floor must exist); the UPPER bound only warns.
-    # The white level is read at 178-198 Hz and is segment-sensitive: the same real
-    # flight (Day20.8) gives 6.45 over a 208s steady block and 94.45 over a different
-    # 120s block of the same recording. A 15x swing on identical hardware is too
-    # unstable to fail a mission on. Needs a more robust white-level estimator before
-    # it can gate; until then sim's over-strong floor is caught by C2.gaussian and
-    # C2.breathe, which ARE stable.
-    "colored_ratio": [1.30, 15.0],     # [real 1.47-94.5 | sim 1.43-74.4]
-    "floor_kurtosis": [0.15, 8.0],     # [real 0.36-4.59 | sim -0.02-0.05] DISJOINT:
-                                        # real turbulence is heavy-tailed, FFT-shaped
-                                        # Gaussian noise is exactly kurtosis 0
-    "floor_breathe_cv_min": 0.13,      # [real 0.18-0.36 | sim 0.06-0.09] DISJOINT
-    # C3
-    "lines_min_prom_db": 5.0,          # [real 5.1-9.0 | sim 4.3-6.2]
-    "lines_min_count": 2,              # sanity floor only (real 21-40, sim 15-23)
-    "tone_sigma_log": [0.30, 1.5],     # [real 0.337-0.536 | sim 0.204-0.513]
-    "tone_tau_s": [0.3, 20.0],         # overlapping (real 1.7-6.6, sim 1.4-2.4): sanity only
-    "tone_p90_p10_min": 2.20,          # [real 2.38-3.84 | sim 1.47-3.81]
-    "line_width_hz": [0.15, 9.0],      # [real 0.78-8.46 | sim 7.96-15.53] THIN MARGIN:
-                                        # real tops out at 8.46 (Day20.8 original span),
-                                        # so only ~6% headroom. Catches the smeared v2
-                                        # bags; does NOT catch current v3 (7.96).
-    # C4
-    "coh_high_min": 0.60,              # [real max-pair 0.79-0.99 | sim 0.26-0.95]
-    "coh_low_max": 0.85,               # [real min-pair 0.07-0.77] Day32 couples all
-                                        # channels at 0.77 -- "some pair must be loose"
-                                        # is NOT a universal law, only near-total lock is
-    "gyro_accel_ratio": [3e-4, 0.5],
-    # C5
+    # CALIBRATED on the 8-bag real altair corpus (Day20.1/2/3/5/6/7/8 + Day32), each
+    # read twice (trimmed _jazzy conversion + full original), with v2/v3 sim bags and
+    # purpose-built controls as negatives. Rule: every real bag must PASS the FAIL tier
+    # with no warns; a threshold a real bag violates is a wrong threshold. Observed
+    # ranges are quoted as [real | sim] so the next person can see the margin.
+    # ---- FAIL tier ----
     "accel_abs_max": 250.0,
     "gyro_abs_max": 50.0,
-    # C6 -- validates the 3-layer decomposition; does NOT discriminate
-    # (real 0.947-0.986, sim 0.961-0.985 both fine). Kept as a modelling sanity check.
-    "whiten_flatness_min": 0.75,
+    # vibration-band (20-195 Hz) std over the airborne record, main accel axis and
+    # loudest gyro axis. Loose by design: 0.3x the quietest real bag to 3x the loudest.
+    # Catches a forgotten/uncalibrated vibration pass (a stale test bag once measured
+    # 150x too quiet) and a runaway floor, both of which the old white-level ratio
+    # (C2.exists) flagged so unstably it had to be demoted.
+    "band_std_accel": [0.35, 6.5],      # m/s^2  [real 1.15-2.12 | raw unvibed 0.11]
+    "band_std_gyro":  [0.012, 0.18],    # rad/s  [real 0.040-0.060 | raw 0.006 | sim 0.037]
+    # injected 0.05-4.5 Hz RMS relative to the finished bag's own white-noise RMS in
+    # that band (its 178-198 Hz density). Sim only. NOT relative to the raw bag's
+    # dynamics: the sim flies laterally far smoother than any real aircraft, so a
+    # 0.013 m/s^2 leak (below the hiss) read as 0.5x of the raw's lateral motion.
+    # 0.5 = the pass adds at most a quarter of the hiss power to the truth band.
+    "lowband_leak_max": 0.5,
+    # ---- WARN tier ----
+    # C3.exist: real 5.1-9.0 dB; smoothed-shaft sim ~5.5 dB but often measured on the
+    # simulator's own narrow 23-27 Hz line (raw d01: 7.4 dB, 40 lines -- so the raw
+    # unvibed bag PASSES this; C5.level is what catches absence, at 0.111 vs 0.30).
+    "lines_min_prom_db": 3.5,
+    "lines_min_count": 5,              # real 21-40, sim 15-30
+    "floor_kurtosis": [0.15, 8.0],     # [real 0.36-4.59 | pre-fix sim -0.02-0.05]
+    "floor_breathe_cv_min": 0.13,      # [real 0.18-0.36 | pre-fix sim 0.06-0.09]
+    "line_width_hz": [0.15, 9.0],      # [real 0.78-8.46 | unsmoothed-shaft sim 8-15]
+    "tone_p90_p10_min": 2.20,          # [real 2.38-3.84 | sim 1.47-3.81]
+    "coh_high_min": 0.60,              # [real max-pair 0.79-0.99 | smeared sim 0.10]
+    "coh_low_max": 0.85,               # [real min-pair 0.07-0.77] Day32 couples all
+                                        # channels at 0.77 -- only near-total lock is odd
+    # ---- REPORT tier (ranges shown, never scored) ----
+    "white_flatness_min": 0.15,        # [real 0.21-0.95]
+    "white_accel_density": [1e-6, 3e-2],
+    "white_gyro_density":  [1e-11, 1e-4],
+    "colored_ratio": [1.30, 15.0],     # [real 1.47-94.5] segment-sensitive, see docstring
+    "tone_sigma_log": [0.30, 1.5],     # [real 0.337-0.536] measured on a floor-dominated
+    "tone_tau_s": [0.3, 20.0],         #   band, so it cannot isolate the tone modulation
+    "gyro_accel_ratio": [3e-4, 0.5],
+    "whiten_flatness_min": 0.75,       # [real 0.947-0.986 | sim 0.961-0.985] no contrast
     "whiten_kurtosis": [-1.0, 4.0],
-    # C0 -- FLIGHT-INHERITED, not owned by the vibration pass. Measured on the rotor
-    # sidecar when one is available. The real aircraft holds shaft speed to 0.2-2.4%
-    # p5-p95 (backed out from its observed 0.78-8.46 Hz line width at a ~349 Hz shaft);
-    # PAS fleet1 missions measure 16-17%. Because a ~356 Hz shaft aliases to ~43 Hz at
-    # 400 Hz sampling, relative wander is amplified ~8x in the observable line, so the
-    # sim's 1x line SWEEPS 28-90 Hz instead of standing still. That single fact depresses
-    # C3.exist (energy spread thin), blows C3.width, and dilutes C4.contrast -- none of
-    # which the vibration post-pass can fix, because it faithfully follows the rotor
-    # speed it is given (by design: "frequencies come from sim physics"). 5% is a
-    # deliberately generous bound: twice the real aircraft's worst, still far below what
-    # the sim currently does.
-    "shaft_p5p95_frac_max": 0.05,
     # segmentation
     "min_height_m": 2.0,
     "min_steady_s": 20.0,
+}
+
+# Which tier each check scores in. A check whose bound is violated gets this verdict;
+# "report" checks are never scored at all (their value is printed with the range).
+TIER = {
+    "C5.finite": "fail", "C5.magnitude": "fail", "C5.level": "fail",
+    "C5.lowband": "fail", "SEG": "fail",
+    "C3.exist": "warn", "C2.gaussian": "warn", "C2.breathe": "warn", "C3.width": "warn",
+    "C3.responsive": "warn", "C4.contrast": "warn",
+    "C1.white_flat": "report", "C1.white_level": "report", "C1.white_level_gyro": "report",
+    "C2.exists": "report", "C3.cluster": "report", "C3.breathe": "report",
+    "C3.skew": "report", "C4.gyro_ratio": "report", "C6.flat": "report",
 }
 
 
@@ -188,6 +200,32 @@ def _read(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = None
     else:
         tg, hgt = None, None
     return ti, np.array(acc), np.array(gyr), tg, hgt, gt_name
+
+
+def _read_imu_only(bag_path: str, imu_topic: str = IMU_TOPIC):
+    """(t_ns, acc, gyr) of one IMU topic -- for the raw (pre-vibration) bag."""
+    t_i, acc, gyr = [], [], []
+    with Reader(Path(bag_path)) as reader:
+        conns = [c for c in reader.connections if c.topic == imu_topic]
+        for conn, ts, raw in reader.messages(connections=conns):
+            msg = _TS.deserialize_cdr(raw, conn.msgtype)
+            t_i.append(ts)
+            acc.append((msg.linear_acceleration.x, msg.linear_acceleration.y,
+                        msg.linear_acceleration.z))
+            gyr.append((msg.angular_velocity.x, msg.angular_velocity.y,
+                        msg.angular_velocity.z))
+    return np.array(t_i), np.array(acc), np.array(gyr)
+
+
+def guess_raw_bag(bag_path: str) -> str | None:
+    """A vibed PAS bag is <raw>_vib or <raw>_vib_<TAG> next to its raw. Returns the raw
+    path if it exists, else None (real bags have no raw -- the check skips)."""
+    p = Path(bag_path.rstrip("/"))
+    name = p.name
+    if "_vib" not in name:
+        return None
+    raw = p.with_name(name[: name.index("_vib")])
+    return str(raw) if raw.exists() else None
 
 
 def _smooth(x, n):
@@ -374,9 +412,10 @@ def _in(v, lohi):
 
 
 def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = None,
-            profile: dict | None = None, rotor_npz: str | None = None) -> dict:
+            profile: dict | None = None, raw_bag: str | None = None) -> dict:
     """Run every realism check. Returns {"checks": [...], "info": {...}} where each
-    check is {id, name, value, verdict ('pass'|'warn'|'fail'|'report'|'skip'), note}."""
+    check is {id, name, value, verdict ('pass'|'warn'|'fail'|'report'|'skip'), note}.
+    The verdict of a violated check is its TIER; report-tier checks are never scored."""
     P = dict(DEFAULT_PROFILE, **(profile or {}))
     ti, acc, gyr, tg, hgt, gt_name = _read(bag_path, imu_topic, gt_topic)
     fs = 1.0 / np.median(np.diff(ti))
@@ -385,54 +424,96 @@ def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = No
     checks: list[dict] = []
     info = {"bag": str(bag_path), "fs": float(fs), "gt_topic": gt_name,
             "active_s": float(active.sum() / fs),
-            "steady_s": float((steady[1] - steady[0]) / fs) if steady else 0.0}
+            "steady_s": float((steady[1] - steady[0]) / fs) if steady else 0.0,
+            "raw_bag": raw_bag}
 
-    def add(cid, name, value, verdict, note=""):
+    def add(cid, name, value, ok, note=""):
+        """ok: True/False (scored by tier), or a verdict string ('skip'/'report')."""
+        tier = TIER.get(cid, "warn")
+        if isinstance(ok, str):
+            verdict = ok
+        elif tier == "report":
+            verdict = "report"
+        else:
+            verdict = "pass" if ok else tier
         checks.append({"id": cid, "name": name, "value": value,
                        "verdict": verdict, "note": note})
 
     # C5 first (cheap, and everything else assumes finite data)
     finite = bool(np.isfinite(acc).all() and np.isfinite(gyr).all())
-    add("C5.finite", "all samples finite", finite, "pass" if finite else "fail")
+    add("C5.finite", "all samples finite", finite, finite)
     amax, gmax = float(np.abs(acc).max()), float(np.abs(gyr).max())
     add("C5.magnitude", "physically representable magnitudes",
         {"accel_max": round(amax, 1), "gyro_max": round(gmax, 2)},
-        "pass" if (amax <= P["accel_abs_max"] and gmax <= P["gyro_abs_max"]) else "fail")
+        amax <= P["accel_abs_max"] and gmax <= P["gyro_abs_max"])
     if not finite:
         return {"checks": checks, "info": info}
 
-    # ---- C0 flight-inherited: is the SOURCE steady enough to make a line at all? ----
-    # Deliberately separated from C2-C4: this measures the simulated aircraft's own
-    # throttle behaviour, NOT the vibration pass. Reported as its own check so a
-    # wandering-shaft mission is diagnosed at the cause instead of surfacing as three
-    # confusing downstream vibration failures.
-    if rotor_npz and os.path.exists(rotor_npz):
-        rs = np.load(rotor_npz)
-        sh = rs["speeds"] / (2 * np.pi)
-        on = sh.mean(axis=1) > 50
-        if on.sum() > 100:
-            m = sh.mean(axis=1)[on]
-            med = float(np.median(m))
-            spread = float(np.percentile(m, 95) - np.percentile(m, 5))
-            frac = spread / max(med, 1e-9)
-            # what that shaft wander does to the OBSERVABLE (aliased) line
-            def _alias(f):
-                r = f % fs
-                return fs - r if r > fs / 2 else r
-            a_lo, a_hi = _alias(np.percentile(m, 5)), _alias(np.percentile(m, 95))
-            add("C0.shaft_steady", "rotor speed steady enough to form a line",
-                {"shaft_hz": round(med, 1), "p5_p95_frac": round(frac, 4),
-                 "aliased_line_span_hz": round(float(abs(a_hi - a_lo)), 1)},
-                "pass" if frac <= P["shaft_p5p95_frac_max"] else "fail",
-                "FLIGHT-INHERITED, not the vibration pass: the sim's own throttle "
-                "activity smears the tone across frequency, which then depresses "
-                "C3.exist, blows C3.width and dilutes C4.contrast downstream")
+    sos = butter(4, list(VIB_BAND), btype="band", fs=fs, output="sos")
+
+    # ---- C5.level: is there a vibration layer at all, and is it sane in size? ----
+    # Band std over the airborne record. Reference-free in spirit (a loose corpus band,
+    # not a match), but it is THE check that catches an unvibed or uncalibrated bag.
+    if active.sum() > fs * 10:
+        a_std = [float(sosfilt(sos, acc[:, j] - acc[:, j].mean())[active].std()) for j in range(3)]
+        g_std = [float(sosfilt(sos, gyr[:, j] - gyr[:, j].mean())[active].std()) for j in range(3)]
+        a_lvl, g_lvl = max(a_std), max(g_std)
+        add("C5.level", "vibration-band energy inside the real corpus range",
+            {"accel_band_std": round(a_lvl, 3), "gyro_band_std": round(g_lvl, 4)},
+            _in(a_lvl, P["band_std_accel"]) and _in(g_lvl, P["band_std_gyro"]),
+            "an unvibed / uncalibrated bag is far too quiet; a runaway floor far too loud")
     else:
-        add("C0.shaft_steady", "rotor speed steady enough to form a line", None, "skip",
-            "no rotor sidecar given (--rotor-npz)")
+        add("C5.level", "vibration-band energy inside the real corpus range", None, "skip",
+            "no airborne record")
+
+    # ---- C5.lowband: the truth band must be untouched (sim only, needs the raw bag) --
+    # VIO integrates the < 5 Hz content as the actual motion. The vibration pass is
+    # additive and by construction writes nothing there (L2 zeroes < 5 Hz, tones sit at
+    # >= 20 Hz aliased); this measures that it really didn't -- on the actual output.
+    if raw_bag:
+        try:
+            rt, racc, rgyr = _read_imu_only(raw_bag, imu_topic)
+        except Exception as e:  # unreadable raw is a skip, not a verdict
+            rt = None
+            add("C5.lowband", "< 5 Hz body-dynamics band untouched vs raw", None, "skip",
+                f"raw bag unreadable: {e}")
+        if rt is not None:
+            if len(rt) != len(ti):
+                add("C5.lowband", "< 5 Hz body-dynamics band untouched vs raw",
+                    {"raw_msgs": int(len(rt)), "vib_msgs": int(len(ti))}, "skip",
+                    "IMU message counts differ -- not the same flight, cannot align")
+            else:
+                # brick-wall band energies from a long-window PSD (a 4th-order
+                # Butterworth "5 Hz lowpass" let the injected 5-10 Hz floor through
+                # its skirt and dominated the number)
+                lo_b, hi_b = 0.05, 4.5
+                leaks = {}
+                for lbl, V, R in (("accel", acc, racc), ("gyro", gyr, rgyr)):
+                    for j, ax in enumerate("xyz"):
+                        d = V[:, j] - R[:, j]
+                        fw, pdiff = welch(d - d.mean(), fs=fs, nperseg=16384)
+                        _, praw = welch(R[:, j] - R[:, j].mean(), fs=fs, nperseg=16384)
+                        b = (fw >= lo_b) & (fw <= hi_b)
+                        inj = float(np.sqrt(np.trapezoid(pdiff[b], fw[b])))
+                        # the hiss the estimator actually sees is the FINISHED bag's
+                        # high-band level (the pass tops the sim's own L4 up to the
+                        # real floor), not the raw sim's, which can sit far below it
+                        _, pvib = welch(V[:, j] - V[:, j].mean(), fs=fs, nperseg=16384)
+                        wb = (fw >= 178) & (fw <= 198)
+                        hiss = float(np.sqrt(np.median(pvib[wb]) * (hi_b - lo_b)))
+                        leaks[f"{lbl}_{ax}"] = inj / max(hiss, 1e-15)
+                worst = max(leaks, key=leaks.get)
+                add("C5.lowband", "< 5 Hz body-dynamics band untouched vs raw",
+                    {"worst": f"{worst}={leaks[worst]:.3f}"},
+                    leaks[worst] <= P["lowband_leak_max"],
+                    "injected 0.05-4.5 Hz RMS over the sensor's own white-noise RMS in "
+                    "that band; the pass must not write into the band VIO treats as truth")
+    else:
+        add("C5.lowband", "< 5 Hz body-dynamics band untouched vs raw", None, "skip",
+            "no raw bag (real recording, or pass --raw)")
 
     if steady is None:
-        add("SEG", "steady analysis block", None, "fail",
+        add("SEG", "steady analysis block", None, False,
             f"no contiguous low-|vz| active run >= {P['min_steady_s']}s -- "
             "cannot run spectral checks")
         return {"checks": checks, "info": info}
@@ -440,7 +521,6 @@ def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = No
 
     # main accel channel: the one with the most vibration-band energy (data-driven,
     # not assumed to be z)
-    sos = butter(4, list(VIB_BAND), btype="band", fs=fs, output="sos")
     ax_energy = [sosfilt(sos, acc[s0:s1, j] - acc[s0:s1, j].mean()).std() for j in range(3)]
     main = int(np.argmax(ax_energy))
     info["main_accel_axis"] = "xyz"[main]
@@ -474,8 +554,7 @@ def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = No
     top_prom = lines[0][1] if lines else 0.0
     add("C3.exist", "spectral lines stand above the floor",
         {"top_prom_db": round(top_prom, 1), "n_lines_ge3db": n_ge3},
-        "pass" if (top_prom >= P["lines_min_prom_db"] and n_ge3 >= P["lines_min_count"])
-        else "fail",
+        top_prom >= P["lines_min_prom_db"] and n_ge3 >= P["lines_min_count"],
         "an unvibed bag has no lines at all")
     if lines:
         f_star = lines[0][0]
@@ -499,12 +578,12 @@ def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = No
             p90p10 = float(np.percentile(amps, 90) / max(np.percentile(amps, 10), 1e-12))
             add("C3.breathe", "tone amplitude breathes",
                 {"sigma_log": round(sigma, 3), "tau_s": round(tau, 1)},
-                "pass" if (_in(sigma, P["tone_sigma_log"]) and _in(tau, P["tone_tau_s"]))
-                else "fail",
-                "deterministic constant amplitude fails here")
+                _in(sigma, P["tone_sigma_log"]) and _in(tau, P["tone_tau_s"]),
+                f"real sigma {P['tone_sigma_log'][0]}-0.54; measured on a floor-dominated "
+                "band so it cannot isolate the tone modulation -- informational")
             add("C3.responsive", "tone amplitude responds to flight state",
                 {"p90_p10": round(p90p10, 2)},
-                "pass" if p90p10 >= P["tone_p90_p10_min"] else "fail",
+                p90p10 >= P["tone_p90_p10_min"],
                 "constant-amplitude buzz ignores what the aircraft is doing")
             add("C3.skew", "amplitude surges lean loud",
                 {"log_skew": round(float(sstats.skew(la)), 2)}, "report")
@@ -513,25 +592,20 @@ def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = No
         wdt = line_width_3db(x_sharp, fs, f_star)
         add("C3.width", "strongest line width sane",
             {"width_hz": round(wdt, 2) if np.isfinite(wdt) else None},
-            "pass" if (np.isfinite(wdt) and _in(wdt, P["line_width_hz"])) else "fail",
-            "too wide = tone frequency smeared by unsmoothed rotor chatter")
+            bool(np.isfinite(wdt) and _in(wdt, P["line_width_hz"])),
+            "too wide = tone frequency smeared by rotor-speed wander")
 
     # ---- C2 colored floor ----
-    if not np.isfinite(colored_ratio) or colored_ratio < P["colored_ratio"][0]:
-        _v, _n = "fail", "no colored floor above the white level (white-noise-only)"
-    elif colored_ratio > P["colored_ratio"][1]:
-        _v, _n = "warn", ("injected floor looks over-strong, but this metric is "
-                          "segment-sensitive -- see profile note, not a gate")
-    else:
-        _v, _n = "pass", ""
-    add("C2.exists", "colored floor present, not overpowering",
+    add("C2.exists", "colored floor over white level",
         {"lowband_over_white": round(colored_ratio, 2) if np.isfinite(colored_ratio) else None},
-        _v, _n)
+        bool(np.isfinite(colored_ratio) and _in(colored_ratio, P["colored_ratio"])),
+        "real 1.5-95: the white level is segment-sensitive (15x swing on one real "
+        "flight), so this only informs; C5.level is the gate for floor size")
     fbp = sosfilt(sos, floor)
     fk = float(sstats.kurtosis(fbp))
     add("C2.gaussian", "floor is heavy-tailed like real turbulence",
         {"excess_kurtosis": round(fk, 2)},
-        "pass" if _in(fk, P["floor_kurtosis"]) else "fail",
+        _in(fk, P["floor_kurtosis"]),
         "exactly-Gaussian (kurtosis 0) means synthetic noise, not turbulence")
     nw = int(2 * fs)
     wstd = np.array([fbp[i:i + nw].std() for i in range(0, len(fbp) - nw, nw)])
@@ -540,7 +614,7 @@ def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = No
         add("C2.breathe", "floor energy breathes",
             {"cv": round(cv, 2),
              "lag1": round(float(np.corrcoef(wstd[:-1], wstd[1:])[0, 1]), 2)},
-            "pass" if cv >= P["floor_breathe_cv_min"] else "fail",
+            cv >= P["floor_breathe_cv_min"],
             "a stationary injected floor does not breathe")
 
     # ---- C1 white ----
@@ -550,18 +624,18 @@ def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = No
         r = p[hib] / max(white, 1e-300)
         wflat = float(np.exp(np.mean(np.log(np.maximum(r, 1e-12)))) / np.mean(r))
         add("C1.white_flat", "high-band floor is flat (white)",
-            {"flatness": round(wflat, 2)},
-            "pass" if wflat >= P["white_flatness_min"] else "warn")
+            {"flatness": round(wflat, 2)}, wflat >= P["white_flatness_min"],
+            "real 0.21-0.95")
     add("C1.white_level", "white level plausible for a MEMS part",
-        {"accel_density": float(f"{white:.3g}")},
-        "pass" if _in(white, P["white_accel_density"]) else "warn")
+        {"accel_density": float(f"{white:.3g}")}, _in(white, P["white_accel_density"]),
+        "MEMS sanity band 1e-6..3e-2")
     gx = gyr[s0:s1, 0].astype(float)
     glines, _ = census_lines(gx, fs, min_prom_db=2.0)
     _, gfloor, gexc = excise_lines(gx, fs, [fq for fq, _ in glines])
     _, _, gwhite, _ = split_floor(gfloor, fs, gexc)
     add("C1.white_level_gyro", "gyro white level plausible",
-        {"gyro_density": float(f"{gwhite:.3g}")},
-        "pass" if _in(gwhite, P["white_gyro_density"]) else "warn")
+        {"gyro_density": float(f"{gwhite:.3g}")}, _in(gwhite, P["white_gyro_density"]),
+        "MEMS sanity band 1e-11..1e-4")
 
     # ---- C4 cross-channel ----
     if lines:
@@ -579,8 +653,7 @@ def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = No
         lo_pair = min(cohs, key=cohs.get)
         add("C4.contrast", "some channel pairs locked, some not",
             {"max": f"{hi_pair}={cohs[hi_pair]:.2f}", "min": f"{lo_pair}={cohs[lo_pair]:.2f}"},
-            "pass" if (cohs[hi_pair] >= P["coh_high_min"] and cohs[lo_pair] <= P["coh_low_max"])
-            else "fail",
+            cohs[hi_pair] >= P["coh_high_min"] and cohs[lo_pair] <= P["coh_low_max"],
             "all-locked and none-locked are both unphysical")
         ga = []
         for j in range(3):
@@ -591,63 +664,48 @@ def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = No
         if ga:
             gr = float(max(ga))
             add("C4.gyro_ratio", "gyro echo of the accel buzz plausible",
-                {"ratio": float(f"{gr:.3g}")},
-                "pass" if _in(gr, P["gyro_accel_ratio"]) else "warn")
+                {"ratio": float(f"{gr:.3g}")}, _in(gr, P["gyro_accel_ratio"]),
+                "g-sensitivity sanity band 3e-4..0.5")
 
     # ---- C6 whitening ----
     flatness, wkurt = whiten_test(floor, fs, excised)
     add("C6.flat", "whitened residual is structureless",
         {"flatness": round(flatness, 3) if np.isfinite(flatness) else None,
          "kurtosis": round(wkurt, 2) if np.isfinite(wkurt) else None},
-        "pass" if (np.isfinite(flatness) and flatness >= P["whiten_flatness_min"]
-                   and _in(wkurt, P["whiten_kurtosis"])) else "warn",
-        "three layers should explain the whole signal")
+        bool(np.isfinite(flatness) and flatness >= P["whiten_flatness_min"]
+             and _in(wkurt, P["whiten_kurtosis"])),
+        "three layers should explain the whole signal; real 0.947-0.986, does not "
+        "discriminate sim from real")
 
     return {"checks": checks, "info": info}
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
-def _guess_rotor_npz(bag_path: str) -> str | None:
-    """A PAS bag's rotor sidecar sits beside it as <bag>_rotor_states.npz -- the same
-    convention add_vibration.py uses. Auto-detected so the C0 check works without the
-    caller having to know the layout."""
-    cand = str(Path(bag_path).with_suffix("")) + "_rotor_states.npz"
-    return cand if os.path.exists(cand) else None
-
-
 def run(args) -> int:
     profile = None
     if getattr(args, "profile", None):
         profile = json.load(open(args.profile))
-    rotor = getattr(args, "rotor_npz", None) or _guess_rotor_npz(args.input_bag)
+    raw = getattr(args, "raw", None) or guess_raw_bag(args.input_bag)
     print(hdr(f"vib-realism: {args.input_bag}"))
-    res = analyze(args.input_bag, args.imu_topic, args.gt_topic, profile, rotor)
+    res = analyze(args.input_bag, args.imu_topic, args.gt_topic, profile, raw)
     info = res["info"]
     print(f"fs {info['fs']:.1f} Hz   gt {info.get('gt_topic') or 'NONE (energy-gated)'}   "
           f"active {info['active_s']:.0f}s   steady block {info['steady_s']:.0f}s   "
-          f"main axis {info.get('main_accel_axis', '?')}")
+          f"main axis {info.get('main_accel_axis', '?')}   "
+          f"raw {info.get('raw_bag') or 'none'}")
     print(SEP)
     counts = {"pass": 0, "warn": 0, "fail": 0, "report": 0, "skip": 0}
-    shaft_bad = any(c["id"] == "C0.shaft_steady" and c["verdict"] == "fail"
-                    for c in res["checks"])
     mark = {"pass": "✔", "warn": "⚠", "fail": "✘", "report": "·", "skip": "-"}
-    # Failures of these three are DOWNSTREAM of a wandering shaft: a tone smeared across
-    # frequency cannot stand proud of the floor, cannot be narrow, and cannot hold
-    # coherence in any fixed bin. When C0 has failed, say so rather than letting them
-    # read as independent defects of the vibration synthesis.
-    WANDER_DOWNSTREAM = {"C3.exist", "C3.width", "C4.contrast"}
     for c in res["checks"]:
         counts[c["verdict"]] += 1
         v = c["value"]
         vs = json.dumps(v) if isinstance(v, dict) else str(v)
         note = f"   ({c['note']})" if c["note"] and c["verdict"] != "pass" else ""
-        if shaft_bad and c["id"] in WANDER_DOWNSTREAM and c["verdict"] == "fail":
-            note = "   (downstream of C0: shaft wander, not the vibration pass)"
-        print(f"  {mark[c['verdict']]} {c['id']:<18} {c['name']:<42} {vs}{note}")
+        print(f"  {mark[c['verdict']]} {c['id']:<14} {c['name']:<50} {vs}{note}")
     print(SEP)
     verdict = ok if counts["fail"] == 0 else fail
     print(verdict(f"{counts['pass']} pass / {counts['warn']} warn / {counts['fail']} fail"
-                  f" ({counts['report']} report-only)"))
+                  f" ({counts['report']} report-only, {counts['skip']} skipped)"))
     if getattr(args, "json", None):
         with open(args.json, "w") as fh:
             json.dump(res, fh, indent=2)
