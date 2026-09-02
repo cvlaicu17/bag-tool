@@ -46,6 +46,7 @@ residual there comes out at spectral flatness 0.981, kurtosis +0.20):
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -122,6 +123,18 @@ DEFAULT_PROFILE = {
     # (real 0.947-0.986, sim 0.961-0.985 both fine). Kept as a modelling sanity check.
     "whiten_flatness_min": 0.75,
     "whiten_kurtosis": [-1.0, 4.0],
+    # C0 -- FLIGHT-INHERITED, not owned by the vibration pass. Measured on the rotor
+    # sidecar when one is available. The real aircraft holds shaft speed to 0.2-2.4%
+    # p5-p95 (backed out from its observed 0.78-8.46 Hz line width at a ~349 Hz shaft);
+    # PAS fleet1 missions measure 16-17%. Because a ~356 Hz shaft aliases to ~43 Hz at
+    # 400 Hz sampling, relative wander is amplified ~8x in the observable line, so the
+    # sim's 1x line SWEEPS 28-90 Hz instead of standing still. That single fact depresses
+    # C3.exist (energy spread thin), blows C3.width, and dilutes C4.contrast -- none of
+    # which the vibration post-pass can fix, because it faithfully follows the rotor
+    # speed it is given (by design: "frequencies come from sim physics"). 5% is a
+    # deliberately generous bound: twice the real aircraft's worst, still far below what
+    # the sim currently does.
+    "shaft_p5p95_frac_max": 0.05,
     # segmentation
     "min_height_m": 2.0,
     "min_steady_s": 20.0,
@@ -361,7 +374,7 @@ def _in(v, lohi):
 
 
 def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = None,
-            profile: dict | None = None) -> dict:
+            profile: dict | None = None, rotor_npz: str | None = None) -> dict:
     """Run every realism check. Returns {"checks": [...], "info": {...}} where each
     check is {id, name, value, verdict ('pass'|'warn'|'fail'|'report'|'skip'), note}."""
     P = dict(DEFAULT_PROFILE, **(profile or {}))
@@ -387,6 +400,36 @@ def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = No
         "pass" if (amax <= P["accel_abs_max"] and gmax <= P["gyro_abs_max"]) else "fail")
     if not finite:
         return {"checks": checks, "info": info}
+
+    # ---- C0 flight-inherited: is the SOURCE steady enough to make a line at all? ----
+    # Deliberately separated from C2-C4: this measures the simulated aircraft's own
+    # throttle behaviour, NOT the vibration pass. Reported as its own check so a
+    # wandering-shaft mission is diagnosed at the cause instead of surfacing as three
+    # confusing downstream vibration failures.
+    if rotor_npz and os.path.exists(rotor_npz):
+        rs = np.load(rotor_npz)
+        sh = rs["speeds"] / (2 * np.pi)
+        on = sh.mean(axis=1) > 50
+        if on.sum() > 100:
+            m = sh.mean(axis=1)[on]
+            med = float(np.median(m))
+            spread = float(np.percentile(m, 95) - np.percentile(m, 5))
+            frac = spread / max(med, 1e-9)
+            # what that shaft wander does to the OBSERVABLE (aliased) line
+            def _alias(f):
+                r = f % fs
+                return fs - r if r > fs / 2 else r
+            a_lo, a_hi = _alias(np.percentile(m, 5)), _alias(np.percentile(m, 95))
+            add("C0.shaft_steady", "rotor speed steady enough to form a line",
+                {"shaft_hz": round(med, 1), "p5_p95_frac": round(frac, 4),
+                 "aliased_line_span_hz": round(float(abs(a_hi - a_lo)), 1)},
+                "pass" if frac <= P["shaft_p5p95_frac_max"] else "fail",
+                "FLIGHT-INHERITED, not the vibration pass: the sim's own throttle "
+                "activity smears the tone across frequency, which then depresses "
+                "C3.exist, blows C3.width and dilutes C4.contrast downstream")
+    else:
+        add("C0.shaft_steady", "rotor speed steady enough to form a line", None, "skip",
+            "no rotor sidecar given (--rotor-npz)")
 
     if steady is None:
         add("SEG", "steady analysis block", None, "fail",
@@ -564,24 +607,42 @@ def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = No
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
+def _guess_rotor_npz(bag_path: str) -> str | None:
+    """A PAS bag's rotor sidecar sits beside it as <bag>_rotor_states.npz -- the same
+    convention add_vibration.py uses. Auto-detected so the C0 check works without the
+    caller having to know the layout."""
+    cand = str(Path(bag_path).with_suffix("")) + "_rotor_states.npz"
+    return cand if os.path.exists(cand) else None
+
+
 def run(args) -> int:
     profile = None
     if getattr(args, "profile", None):
         profile = json.load(open(args.profile))
+    rotor = getattr(args, "rotor_npz", None) or _guess_rotor_npz(args.input_bag)
     print(hdr(f"vib-realism: {args.input_bag}"))
-    res = analyze(args.input_bag, args.imu_topic, args.gt_topic, profile)
+    res = analyze(args.input_bag, args.imu_topic, args.gt_topic, profile, rotor)
     info = res["info"]
     print(f"fs {info['fs']:.1f} Hz   gt {info.get('gt_topic') or 'NONE (energy-gated)'}   "
           f"active {info['active_s']:.0f}s   steady block {info['steady_s']:.0f}s   "
           f"main axis {info.get('main_accel_axis', '?')}")
     print(SEP)
     counts = {"pass": 0, "warn": 0, "fail": 0, "report": 0, "skip": 0}
+    shaft_bad = any(c["id"] == "C0.shaft_steady" and c["verdict"] == "fail"
+                    for c in res["checks"])
     mark = {"pass": "✔", "warn": "⚠", "fail": "✘", "report": "·", "skip": "-"}
+    # Failures of these three are DOWNSTREAM of a wandering shaft: a tone smeared across
+    # frequency cannot stand proud of the floor, cannot be narrow, and cannot hold
+    # coherence in any fixed bin. When C0 has failed, say so rather than letting them
+    # read as independent defects of the vibration synthesis.
+    WANDER_DOWNSTREAM = {"C3.exist", "C3.width", "C4.contrast"}
     for c in res["checks"]:
         counts[c["verdict"]] += 1
         v = c["value"]
         vs = json.dumps(v) if isinstance(v, dict) else str(v)
         note = f"   ({c['note']})" if c["note"] and c["verdict"] != "pass" else ""
+        if shaft_bad and c["id"] in WANDER_DOWNSTREAM and c["verdict"] == "fail":
+            note = "   (downstream of C0: shaft wander, not the vibration pass)"
         print(f"  {mark[c['verdict']]} {c['id']:<18} {c['name']:<42} {vs}{note}")
     print(SEP)
     verdict = ok if counts["fail"] == 0 else fail

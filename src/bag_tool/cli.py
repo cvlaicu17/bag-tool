@@ -447,6 +447,11 @@ def main() -> None:
                                         "vib_realism.DEFAULT_PROFILE)")
     vibrealism_parser.add_argument("--json", default=None, metavar="FILE",
                                    help="Also write the full result as JSON")
+    vibrealism_parser.add_argument(
+        "--rotor-npz", default=None, metavar="NPZ",
+        help="Rotor-speed sidecar (<bag>_rotor_states.npz) for the C0 shaft-steadiness "
+             "check, which attributes a smeared tone to the SIM'S OWN throttle activity "
+             "rather than to the vibration pass. Auto-detected beside the bag if present.")
 
     # ---- vib-fit-harmonic-targets subcommand ----
     vibharm_parser = subparsers.add_parser(
