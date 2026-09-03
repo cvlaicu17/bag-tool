@@ -437,8 +437,20 @@ def _in(v, lohi):
     return lohi[0] <= v <= lohi[1]
 
 
+RAW_TOPIC_LIVE = "/imu/data_raw_sim"     # a LIVE_VIB=1 recording keeps the clean stream here
+
+
+def _has_topic(bag_path: str, topic: str) -> bool:
+    try:
+        with Reader(Path(bag_path)) as reader:
+            return any(c.topic == topic for c in reader.connections)
+    except Exception:
+        return False
+
+
 def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = None,
-            profile: dict | None = None, raw_bag: str | None = None) -> dict:
+            profile: dict | None = None, raw_bag: str | None = None,
+            raw_topic: str | None = None) -> dict:
     """Run every realism check. Returns {"checks": [...], "info": {...}} where each
     check is {id, name, value, verdict ('pass'|'warn'|'fail'|'report'|'skip'), note}.
     The verdict of a violated check is its TIER; report-tier checks are never scored."""
@@ -492,12 +504,17 @@ def analyze(bag_path: str, imu_topic: str = IMU_TOPIC, gt_topic: str | None = No
         add("C5.level", "vibration-band energy inside the real corpus range", None, "skip",
             "no airborne record")
 
-    # ---- raw (pre-vibration) bag, sim only: shared by C7.injected and C5.lowband ----
+    # ---- raw (pre-vibration) stream, sim only: shared by C7.injected and C5.lowband.
+    # Either a separate raw bag (post-pass workflow) or a clean topic inside THIS bag
+    # (LIVE_VIB=1 recordings keep /imu/data_raw_sim next to the vibrated /imu/data_raw).
     racc = rgyr = None
     raw_note = None
+    if not raw_bag and not raw_topic and _has_topic(bag_path, RAW_TOPIC_LIVE):
+        raw_bag, raw_topic = bag_path, RAW_TOPIC_LIVE
+    info["raw_bag"] = raw_bag if raw_bag != bag_path else f"{RAW_TOPIC_LIVE} (same bag, live-vib)"
     if raw_bag:
         try:
-            rt, racc, rgyr = _read_imu_only(raw_bag, imu_topic)
+            rt, racc, rgyr = _read_imu_only(raw_bag, raw_topic or imu_topic)
             if len(rt) != len(ti):
                 raw_note = (f"IMU message counts differ (raw {len(rt)}, vib {len(ti)}) -- "
                             "not the same flight, cannot align")
@@ -792,7 +809,8 @@ def run(args) -> int:
     if getattr(args, "profile", None):
         profile = json.load(open(args.profile))
     raw = getattr(args, "raw", None) or guess_raw_bag(args.input_bag)
-    res = analyze(args.input_bag, args.imu_topic, args.gt_topic, profile, raw)
+    res = analyze(args.input_bag, args.imu_topic, args.gt_topic, profile, raw,
+                  getattr(args, "raw_topic", None))
     counts = print_report(res, f"vib-realism: {args.input_bag}")
     if getattr(args, "json", None):
         with open(args.json, "w") as fh:

@@ -449,6 +449,10 @@ def main() -> None:
     vibrealism_parser.add_argument("--json", default=None, metavar="FILE",
                                    help="Also write the full result as JSON")
     vibrealism_parser.add_argument(
+        "--raw-topic", default=None, metavar="TOPIC",
+        help="Clean IMU topic inside the SAME bag (LIVE_VIB=1 recordings keep "
+             "/imu/data_raw_sim; auto-detected when present)")
+    vibrealism_parser.add_argument(
         "--raw", default=None, metavar="BAG",
         help="The RAW (pre-vibration) bag this output was generated from, for the "
              "C5.lowband invariant (the < 5 Hz body-dynamics band must be untouched). "
@@ -545,6 +549,9 @@ def main() -> None:
     simcheck_parser.add_argument("--raw", default=None, metavar="BAG",
                                  help="RAW (pre-vibration) bag for the < 5 Hz invariant; "
                                       "auto-detected as <raw> for a <raw>_vib[_TAG] bag")
+    simcheck_parser.add_argument("--raw-topic", default=None, metavar="TOPIC",
+                                 help="Clean IMU topic inside the SAME bag (a LIVE_VIB=1 recording "
+                                      "keeps /imu/data_raw_sim; auto-detected)")
     simcheck_parser.add_argument("--depth-stride", type=int, default=1, metavar="N",
                                  help="Scan every N-th depth frame for seam holes (default: 1 = all)")
     simcheck_parser.add_argument("--depth-limit", type=int, default=0, metavar="N",

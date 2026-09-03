@@ -154,7 +154,8 @@ def run(args) -> int:
     # ---- 3. vibration ----
     print(hdr("3. vibration realism (bag-tool vib-realism)"))
     raw = args.raw or vib_realism.guess_raw_bag(args.input_bag)
-    res = vib_realism.analyze(args.input_bag, args.imu_topic, None, None, raw)
+    res = vib_realism.analyze(args.input_bag, args.imu_topic, None, None, raw,
+                              getattr(args, "raw_topic", None))
     counts = vib_realism.print_report(res)
     summary["sections"]["vibration"] = res
     for c in res["checks"]:
