@@ -26,6 +26,7 @@ from bag_tool.vib_verify import (run as run_vib_verify, measure_targets as vib_m
 from bag_tool.vib_state import run as run_vib_state
 from bag_tool.vib_realism import run as run_vib_realism
 from bag_tool.sim_check import run as run_sim_check
+from bag_tool.cam_lag import run as run_cam_lag
 from bag_tool.platforms import PLATFORMS, detect_from_bag, detect_from_bags
 
 
@@ -553,6 +554,27 @@ def main() -> None:
     simcheck_parser.add_argument("--json", default=None, metavar="FILE",
                                  help="Also write the full result as JSON")
 
+    # ---- cam-lag subcommand ----
+    camlag_parser = subparsers.add_parser(
+        "cam-lag",
+        help="Measure the camera CONTENT lag vs the IMU/GT clock per stream: image rotation "
+             "(log-polar phase correlation, mono and depth alike) against GT yaw rate at the "
+             "turns. Re-run whenever the camera rate or capture code changes.",
+    )
+    camlag_parser.add_argument("input_bag", help="PAS bag directory")
+    camlag_parser.add_argument("--gt-topic", default="/pf_geo_loc/fc_local_position")
+    camlag_parser.add_argument("--depth-topic", default="/camera/depth")
+    camlag_parser.add_argument("--mono-topic", default="/camera/image_mono")
+    camlag_parser.add_argument("--inject-ms", type=float, default=0.0,
+                               help="Self-test: shift the camera stamps by this much first; the "
+                                    "fit must report it back (e.g. --inject-ms 50)")
+    camlag_parser.add_argument("--min-agl", type=float, default=5.0, metavar="M",
+                               help="Ignore frames below this height (no rotation signal on the ground)")
+    camlag_parser.add_argument("--tolerance-ms", type=float, default=0.0,
+                               help="Pass if |lag - expected| <= this (default 0 = 40%% of one frame "
+                                    "interval: the check is zero-or-one-frame, not sub-tick)")
+    camlag_parser.add_argument("--json", default=None, metavar="FILE")
+
     # ---- filter-imu subcommand ----
     filterimu_parser = subparsers.add_parser(
         "filter-imu",
@@ -807,6 +829,10 @@ def main() -> None:
     elif args.command == "sim-check":
         print()
         raise SystemExit(run_sim_check(args))
+
+    elif args.command == "cam-lag":
+        print()
+        raise SystemExit(run_cam_lag(args))
 
     elif args.command == "filter-imu":
         stores = detect_stores_enum()

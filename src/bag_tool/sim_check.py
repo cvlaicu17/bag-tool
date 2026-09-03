@@ -23,8 +23,10 @@ comparison lives on in ``bag-tool vib-verify`` as a CALIBRATION-time tool.
 from __future__ import annotations
 
 import json
+import os
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 
 from bag_tool.vib_check import ok, warn, fail, hdr, SEP
 from bag_tool.vio_check import analyze_topic, read_timestamps
@@ -82,13 +84,31 @@ def run(args) -> int:
     warns: list[str] = []
     print(hdr(f"sim-check: {args.input_bag}"))
 
+    # The camera rate is whatever the bag was flown with: a PAS recording carries it in
+    # <bag>_camera.json (rate_hz, tick-exact -- 20, 40, or 30.77 for a requested 30).
+    # Only fall back to --camera-hz when there is no sidecar, so a 40 fps bag is not
+    # graded against 20 Hz by a stale default.
+    cam_hz = args.camera_hz
+    side = Path(args.input_bag.rstrip("/"))
+    for cand in (str(side) + "_camera.json",
+                 str(side.with_name(side.name.split("_vib")[0])) + "_camera.json"):
+        if os.path.exists(cand):
+            try:
+                rate = json.load(open(cand)).get("rate_hz")
+                if rate:
+                    cam_hz = float(rate)
+                    print(f"  camera rate from {os.path.basename(cand)}: {cam_hz:g} Hz")
+                    break
+            except Exception:
+                pass
+
     # ---- 1. cadence ----
     print(hdr("1. cadence (log / header timestamps)"))
     expectations = (
         TopicExpectation(args.imu_topic, args.imu_hz, args.imu_tolerance),
         TopicExpectation(args.gt_topic, args.gt_hz, args.gt_tolerance),
-        TopicExpectation(args.camera_topic, args.camera_hz, args.camera_tolerance),
-        TopicExpectation(args.depth_topic, args.camera_hz, args.camera_tolerance),
+        TopicExpectation(args.camera_topic, cam_hz, args.camera_tolerance),
+        TopicExpectation(args.depth_topic, cam_hz, args.camera_tolerance),
         TopicExpectation(args.range_topic, args.range_hz, args.range_tolerance),
     )
     recorded = read_timestamps(args.input_bag, [e.topic for e in expectations])
