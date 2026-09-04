@@ -378,13 +378,15 @@ def read_baro_gt(bag_path: str, baro_topic: str, gt_topic: str):
     """Read raw values: barometer range (sensor_msgs/Range) and GT vertical.
 
     GT vertical is taken from .point.z (PointStamped), .pose.position.z
-    (PoseStamped) or .altitude (NavSatFix). Uses the ROS2_HUMBLE typestore so a
-    Range message recorded without the Jazzy `variance` field deserialises.
+    (PoseStamped) or .altitude (NavSatFix). A Range message is tried with the
+    ROS2_JAZZY typestore first (PAS recordings carry the Jazzy `variance` field --
+    with Humble alone every one of them was silently skipped and the bag read as
+    "baro=0") and falls back to ROS2_HUMBLE for bags recorded without it.
     Returns (baro_t, baro_range, gt_t, gt_vert) as numpy arrays (seconds).
     """
     from rosbags.rosbag2 import Reader
     from rosbags.typesys import Stores, get_typestore
-    ts = get_typestore(Stores.ROS2_HUMBLE)
+    stores = [get_typestore(Stores.ROS2_JAZZY), get_typestore(Stores.ROS2_HUMBLE)]
     bt, br, gt, gv = [], [], [], []
     path = Path(bag_path)
     reader_path = path.parent if path.is_file() else path
@@ -392,9 +394,14 @@ def read_baro_gt(bag_path: str, baro_topic: str, gt_topic: str):
     with Reader(reader_path) as reader:
         conns = [c for c in reader.connections if c.topic in want]
         for conn, _ts, raw in reader.messages(connections=conns):
-            try:
-                m = ts.deserialize_cdr(raw, conn.msgtype)
-            except Exception:
+            m = None
+            for ts in stores:
+                try:
+                    m = ts.deserialize_cdr(raw, conn.msgtype)
+                    break
+                except Exception:
+                    continue
+            if m is None:
                 continue
             stamp = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9
             if conn.topic == baro_topic:
