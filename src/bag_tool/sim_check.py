@@ -41,24 +41,32 @@ class TopicExpectation:
 
 
 def _report_topic(expectation: TopicExpectation, captured: dict, gap_mult: float) -> dict:
+    # Not strict on gaps: a single dropped frame (the recorder drops mono+depth as a pair
+    # when a depth frame fails verification, and a render hiccup can stretch one interval)
+    # is a 50-150 ms hole a VIO handles routinely -- fleet1_ardu/d04 had ONE in 9653 frames.
+    # analyze_topic's default rule fails a topic only above 15 gaps or 2 s of total gap,
+    # which is the "broken bag" threshold this gate wants; the rate tolerance stays tight.
     result = analyze_topic(expectation.topic, captured["log_times"], captured["stamp_times"],
                            expectation.rate_hz, gap_mult=gap_mult, latency_outliers=False,
-                           rate_tolerance=expectation.tolerance, strict_gaps=True)
+                           rate_tolerance=expectation.tolerance, strict_gaps=False)
     log = result.get("log_interval", {})
     header = result.get("stamp_interval", {})
     mark = "✔" if result["pass"] else "✘"
     header_text = f"{result['stamp_mean_hz']:.2f} Hz" if header else "n/a"
+    gaps = result.get("gaps", [])
+    max_gap_ms = max((v for _, v in gaps), default=0) / 1e6
     print(f"  {mark} {expectation.topic:<32} n={result['msg_count']:<7} "
           f"log {result.get('mean_hz', 0.0):.2f} Hz  header {header_text}  "
           f"median {log.get('p50', log.get('mean', 0.0)) / 1e6:.3f} ms  "
           f"jitter {100 * result.get('jitter_cv', 0.0):.2f}%  "
-          f"gaps {len(result.get('gaps', []))}/{len(result.get('stamp_gaps', []))}  "
+          f"gaps {len(gaps)}/{len(result.get('stamp_gaps', []))}"
+          + (f" (max {max_gap_ms:.0f} ms)" if gaps else "") + "  "
           f"nonmono {result.get('non_monotonic_log', 0)}/{result.get('non_monotonic_stamp', 0)}  "
           f"(expected {expectation.rate_hz:g} Hz ±{100 * expectation.tolerance:g}%)")
     return {"topic": expectation.topic, "pass": bool(result["pass"]),
             "msgs": result["msg_count"], "log_hz": result.get("mean_hz"),
             "stamp_hz": result.get("stamp_mean_hz"), "jitter_cv": result.get("jitter_cv"),
-            "gaps": len(result.get("gaps", []))}
+            "gaps": len(gaps), "max_gap_ms": round(max_gap_ms, 1)}
 
 
 def _check_depth_association(mono: list[int], depth: list[int]) -> tuple[bool, int, int, int]:
