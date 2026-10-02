@@ -806,6 +806,10 @@ def write_alignment_topics(
             writer.write(conn_rms_rte,      first_ts + ts_offset, _ENCAP + struct.pack('<d', rms_rte))
             writer.write(conn_jump_penalty, first_ts + ts_offset, _ENCAP + struct.pack('<d', jump_penalty))
             print(f'RMS RTE      : {rms_rte:.4f} m')
+            # whole-flight ATE (first-fix aligned, the same per-fix errors as the /ate topic)
+            _ate = np.array([rec[2] for rec in ate_records])
+            rms_ate, max_ate = float(np.sqrt(np.mean(_ate ** 2))), float(_ate.max())
+            print(f'RMS ATE      : {rms_ate:.4f} m  (max {max_ate:.3f} m, first-fix aligned)')
             print(f'Jump penalty : {jump_penalty:.4f} m  (threshold={JUMP_THRESHOLD}m)')
 
             # Phase-specific metrics: ATE/RTE per flight phase. Vertical
@@ -890,7 +894,7 @@ def write_alignment_topics(
             else:
                 avg_slam_feats = None
                 print('WARNING: diag/tracking not in bag — avg_slam_feats skipped')
-            metrics: dict = {'rms_rte': rms_rte, 'jump_penalty': jump_penalty,
+            metrics: dict = {'rms_rte': rms_rte, 'rms_ate': rms_ate, 'max_ate': max_ate, 'jump_penalty': jump_penalty,
                              **phase_metrics}
             if avg_slam_feats is not None:
                 metrics['avg_slam_feats'] = avg_slam_feats
