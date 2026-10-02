@@ -27,6 +27,7 @@ from bag_tool.vib_state import run as run_vib_state
 from bag_tool.vib_realism import run as run_vib_realism
 from bag_tool.sim_check import run as run_sim_check
 from bag_tool.cam_lag import run as run_cam_lag
+from bag_tool.viz3d import run as run_viz3d
 from bag_tool.platforms import PLATFORMS, detect_from_bag, detect_from_bags
 
 
@@ -561,6 +562,20 @@ def main() -> None:
     simcheck_parser.add_argument("--json", default=None, metavar="FILE",
                                  help="Also write the full result as JSON")
 
+    # ---- viz3d subcommand ----
+    viz3d_parser = subparsers.add_parser(
+        "viz3d",
+        help="Write a self-contained interactive 3D HTML (phone-viewable) of a VIO run vs ground truth",
+        description="VIO trajectory vs ground truth, rigidly fitted, with a time scrubber. Ground truth is "
+                    "/pf_geo_loc/fc_local_position, else /fc/gps from --input-bag (re-stamped into the sensor clock).",
+    )
+    viz3d_parser.add_argument("run", help="Run dir (traj.tum or result/ bag) or a result bag")
+    viz3d_parser.add_argument("--input-bag", default=None, help="Original bag (GT source when the result bag has none)")
+    viz3d_parser.add_argument("--vio-topic", default="/basalt/odometry", help="Odometry topic when there is no traj.tum")
+    viz3d_parser.add_argument("--vio-label", default="raven VIO", help="Legend label for the VIO track")
+    viz3d_parser.add_argument("--title", default=None, help="Page title (default: run dir name)")
+    viz3d_parser.add_argument("--out", default=None, help="Output .html (default: <run>/viz3d.html)")
+
     # ---- cam-lag subcommand ----
     camlag_parser = subparsers.add_parser(
         "cam-lag",
@@ -836,6 +851,10 @@ def main() -> None:
     elif args.command == "sim-check":
         print()
         raise SystemExit(run_sim_check(args))
+
+    elif args.command == "viz3d":
+        print()
+        raise SystemExit(run_viz3d(args))
 
     elif args.command == "cam-lag":
         print()
