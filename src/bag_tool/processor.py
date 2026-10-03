@@ -219,6 +219,9 @@ def rms_jump_penalty(rte_values: list[float]) -> tuple[float, float]:
     return rms_rte, jump_penalty
 
 
+# Alignment method/diagnostics of the last compute_alignment call (merged into the eval metrics).
+LAST_ALIGN_INFO: dict = {'align_method': 'first-fix'}
+
 # Topics written by compute_alignment / write_alignment_topics.
 # Used to exclude them from passthrough when the source bag is also the input bag.
 # Superset across all platforms — safe to over-exclude.
@@ -410,8 +413,14 @@ def compute_alignment(
     aruco_yaw_rad: float | None = None,
     platform: PlatformConfig | None = None,
     yaw_rot: int = 0,
+    align_method: str = 'first-fix',
 ) -> tuple:
     """Load ground-truth + VIO data and compute raw + aligned trajectories.
+
+    align_method : 'first-fix' (default; needs the vehicle heading, or the platform constant) or
+                   'dynamic' (bag_tool.dynamic_align: the yaw between the two trajectories is recovered from
+                   the paths themselves, no heading needed; also finds and removes the GT-vs-VIO clock offset).
+                   Falls back to first-fix, loudly, if the flight is too short / straight to determine it.
 
     Returns (out_poses, out_aligned, posimus, typestore, reader_path,
              input_start_ns, input_end_ns, diag_tracking, platform).
@@ -562,6 +571,33 @@ def compute_alignment(
     if n_skipped_for_init:
         print(f'Skipped {n_skipped_for_init} invalid leading VIO frame(s) before finding init pose')
 
+    # Dynamic alignment (no heading): rotation + clock offset + origin from the two trajectories.
+    global LAST_ALIGN_INFO
+    LAST_ALIGN_INFO = {'align_method': 'first-fix'}
+    dyn = None
+    if align_method == 'dynamic':
+        if not (gps_records and posimus):
+            print('WARNING: --align-method dynamic needs ground truth and VIO poses -> using first-fix')
+        else:
+            from bag_tool.dynamic_align import estimate_alignment
+            vf = _decode_posimus(posimus)
+            dyn = estimate_alignment(np.array([sn for _, sn, _, _ in vf]) * 1e-9, np.array([p for _, _, p, _ in vf]),
+                                     np.array([sn for _, sn, _, _ in gps_records]) * 1e-9, np.array([p for _, _, p, _ in gps_records]))
+            if dyn['ok']:
+                lag_ns = int(round(dyn['lag_s'] * 1e9))
+                if lag_ns:
+                    gps_records = [(ts, sn + lag_ns, p, r) for ts, sn, p, r in gps_records]
+                sd = f"{dyn['sd_deg']:.2f}" if dyn['sd_deg'] is not None else 'n/a'
+                print(f"Dynamic alignment: yaw (VIO world -> ENU) {math.degrees(dyn['theta_rad']):+.2f}° ± {sd}° (bootstrap), "
+                      f"{dyn['windows']} windows, coherence {dyn['coherence']:.2f}; GT stamps shifted by {dyn['lag_s']:+.2f} s; origin: {dyn['origin']}")
+                LAST_ALIGN_INFO = {'align_method': 'dynamic', 'align_yaw_world_to_enu_deg': math.degrees(dyn['theta_rad']),
+                                   'align_yaw_sd_deg': dyn['sd_deg'], 'align_gt_lag_s': dyn['lag_s'], 'align_windows': dyn['windows'],
+                                   'align_coherence': dyn['coherence']}
+            else:
+                reason = dyn['reason']
+                print(f"WARNING: dynamic alignment not possible ({reason}) -> falling back to first-fix"); dyn = None
+                LAST_ALIGN_INFO = {'align_method': 'first-fix (dynamic failed)', 'align_failure': reason}
+
     # First-fix alignment: rotate ground-truth into VIO frame using the first matching pair.
     rtk_init_rot  = None
     align_rot     = None
@@ -575,7 +611,12 @@ def compute_alignment(
     use_aruco = platform.aruco_supported and aruco_yaw_rad is not None
 
     for gt_ts, stamp_ns, enu, rot in gps_records:
-        if rtk_init_rot is None:
+        if rtk_init_rot is None and dyn is not None:
+            rtk_init_rot = rot
+            align_rot     = Rotation.from_euler('z', -dyn['theta_rad'])
+            align_rot_pos = align_rot
+            align_trans   = dyn['trans']
+        elif rtk_init_rot is None:
             rtk_init_rot = rot
             if vio_init_rot is not None:
                 rtk_align_rot = vio_init_rot * rtk_init_rot.inv()
@@ -809,7 +850,7 @@ def write_alignment_topics(
             # whole-flight ATE (first-fix aligned, the same per-fix errors as the /ate topic)
             _ate = np.array([rec[2] for rec in ate_records])
             rms_ate, max_ate = float(np.sqrt(np.mean(_ate ** 2))), float(_ate.max())
-            print(f'RMS ATE      : {rms_ate:.4f} m  (max {max_ate:.3f} m, first-fix aligned)')
+            print(f'RMS ATE      : {rms_ate:.4f} m  (max {max_ate:.3f} m, {LAST_ALIGN_INFO["align_method"]} aligned)')
             print(f'Jump penalty : {jump_penalty:.4f} m  (threshold={JUMP_THRESHOLD}m)')
 
             # Phase-specific metrics: ATE/RTE per flight phase. Vertical
@@ -895,7 +936,7 @@ def write_alignment_topics(
                 avg_slam_feats = None
                 print('WARNING: diag/tracking not in bag — avg_slam_feats skipped')
             metrics: dict = {'rms_rte': rms_rte, 'rms_ate': rms_ate, 'max_ate': max_ate, 'jump_penalty': jump_penalty,
-                             **phase_metrics}
+                             **phase_metrics, **LAST_ALIGN_INFO}
             if avg_slam_feats is not None:
                 metrics['avg_slam_feats'] = avg_slam_feats
             return metrics

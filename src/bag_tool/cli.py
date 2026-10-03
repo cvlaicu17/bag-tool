@@ -62,6 +62,7 @@ ALIGN_CONFIG_KEYS = {
     "new_topic": bool,
     "rte_window": (int, float),
     "yaw_rot": int,
+    "align_method": str,
     "out_suffix": str,
 }
 
@@ -221,6 +222,13 @@ def main() -> None:
         type=int, choices=[0, 1, 2, 3], default=0,
         help="Pre-rotate ground-truth pose by N×90° around Z (default: 0). "
              "Use to compensate for unknown IMU mounting orientation in the sensor casket.",
+    )
+    align_parser.add_argument(
+        "--align-method", choices=["first-fix", "dynamic"], default="first-fix",
+        help="first-fix (default): align at the first fix with the vehicle heading / platform constant. "
+             "dynamic: recover the yaw between the VIO and the ground-truth trajectories from the paths themselves "
+             "(no heading needed; ~0.6° vs landmark truth; needs ~90 s of manoeuvring flight after take-off) and remove "
+             "the GT-vs-VIO clock offset. Falls back to first-fix, with a warning, when it cannot be determined.",
     )
     align_parser.add_argument(
         "--out-suffix", default="", metavar="STR",
@@ -734,7 +742,7 @@ def main() -> None:
         run_align(args.input_bag, vio_topic, stores, ref_bag=args.ref_bag, quick=args.quick,
                   rte_window=args.rte_window, eval_mode=args.eval, manual=args.manual,
                   shrink=args.shrink, platform=platform, yaw_rot=args.yaw_rot,
-                  out_suffix=args.out_suffix)
+                  out_suffix=args.out_suffix, align_method=args.align_method)
         if getattr(args, "scale", False):
             from pathlib import Path as _P
             out = args.out_suffix or "_aligned"
