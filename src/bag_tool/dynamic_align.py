@@ -9,8 +9,9 @@ This method recovers the rotation between the VIO world and the ground-truth ENU
   cost(theta) = sum |p - exp(i theta) s|^2  ->  theta = -arg( sum conj(p) s )            (closed form, no iteration)
 Windows of `window_s` seconds starting at take-off (VIO height +2 m) so that the pad and the climb (where the paths are not a rigid pair) are left
 out. The time offset between the GT stamps and the VIO clock (GPS latency; ~0.3 s on orqa, ~0 on Day20) is searched on [-lag_range, lag_range] by the
-minimum of the pooled cost. Translation: the VIO and GT means over the pre-take-off pad (>= 5 GT fixes) so a 1.2 m GPS first fix does not shift
-the whole trajectory; else the first fix. Uncertainty: block bootstrap over windows.
+minimum of the pooled cost. Translation (the start position): the yaw uses the whole flight, the position only the first `origin_s` seconds (default 5 s, never more) of overlap:
+the robust mean (20 % of the farthest samples dropped) of VIO(t) - Rz(-theta) GT(t) over those fixes, so a single 1.2 m GPS fix does not shift the whole
+trajectory and the ATE stays anchored at the start (what the first-fix method did) instead of being fitted over the flight. Fewer than 3 fixes -> the first fix. Uncertainty: block bootstrap over windows.
 
 Validated (flock tools/yaw_align.py, `trajectory` method): 0.61 deg rms against the Day20 landmark georeference (6 flights), unchanged with raw-GPS noise
 (0.62 deg); on 9 orqa flights it agrees to 0.41 deg rms with an inertial (IMU accelerations + attitude vs GPS) estimate. Cost: 15-40 ms per bag.
@@ -21,6 +22,10 @@ not the same path as the VIO (VIO failure, wrong GT, wrong clock).
 from __future__ import annotations
 import math
 import numpy as np
+
+
+def gp_rows(a):
+    return np.atleast_2d(a)
 
 
 def _windows(t_lo, t_hi, w, step):
@@ -48,7 +53,7 @@ def _solve(parts):
 
 
 def estimate_alignment(vio_t, vio_p, gt_t, gt_p, *, window_s=60.0, step_s=30.0, lag_range=1.0, lag_step=0.05,
-                       min_windows=3, nboot=300, seed=0, min_coherence=0.8, apply_lag=True):
+                       min_windows=3, nboot=300, seed=0, min_coherence=0.8, apply_lag=True, origin_s=5.0):
     """vio_t, gt_t: seconds (float, same clock); vio_p, gt_p: (N,3) positions (GT already in ENU, relative to its first fix).
 
     Returns a dict. ok=False with a `reason` if it cannot be trusted (too short, no manoeuvres, incoherent windows); otherwise
@@ -88,15 +93,17 @@ def estimate_alignment(vio_t, vio_p, gt_t, gt_p, *, window_s=60.0, step_s=30.0, 
     res.update(theta_rad=float(th), lag_s=lag if apply_lag else 0.0, lag_found_s=lag, sd_deg=sd, windows=n, coherence=coherence, takeoff_s=t_take)
     if coherence < min_coherence:
         res["reason"] = f"windows are not a rigid pair (coherence {coherence:.2f} < {min_coherence}): straight flight, VIO failure or a wrong GT"; return res
-    # translation GT -> VIO: pad mean before take-off (>= 5 GT fixes), else the first fix
+    # translation GT -> VIO from the first `origin_s` seconds of overlap (origin_s <= 0 or too few fixes: the first fix)
     R = np.array([[math.cos(-th), -math.sin(-th), 0], [math.sin(-th), math.cos(-th), 0], [0, 0, 1]])
     tg = gt_t + (lag if apply_lag else 0.0)
-    pad = (tg >= vio_t[0]) & (tg < t_take - 1.0)
-    if pad.sum() >= 5:
-        vp = np.c_[[np.interp(tg[pad], vio_t, vio_p[:, k]) for k in range(3)]].T
-        res["trans"] = vp.mean(0) - R @ gt_p[pad].mean(0); res["origin"] = f"pad mean ({int(pad.sum())} fixes)"
+    vio_at = lambda t: np.c_[[np.interp(np.clip(t, vio_t[0], vio_t[-1]), vio_t, vio_p[:, k]) for k in range(3)]].T
+    t0 = max(vio_t[0], tg[0]); m = (tg >= t0) & (tg < t0 + origin_s) if origin_s and origin_s > 0 else np.zeros(len(tg), bool)
+    if m.sum() >= 3:
+        offs = vio_at(tg[m]) - (R @ gp_rows(gt_p[m]).T).T; med = np.median(offs, 0); d = np.linalg.norm(offs - med, axis=1)
+        keep = d <= np.quantile(d, 0.8) if m.sum() >= 5 else np.ones(len(d), bool)
+        res["trans"] = offs[keep].mean(0); res["origin"] = f"first {origin_s:.0f} s ({int(m.sum())} fixes, spread {float(np.sqrt(np.mean(d ** 2))):.2f} m)"
+        res["origin_n"] = int(m.sum()); res["origin_spread_m"] = float(np.sqrt(np.mean(d ** 2)))
     else:
-        k = int(np.argmin(np.abs(tg - vio_t[0]))); vp = np.array([np.interp(tg[k], vio_t, vio_p[:, j]) for j in range(3)])
-        res["trans"] = vp - R @ gt_p[k]; res["origin"] = "first fix"
+        k = int(np.argmin(np.abs(tg - t0))); res["trans"] = vio_at(tg[k:k + 1])[0] - R @ gt_p[k]; res["origin"] = "first fix"; res["origin_n"] = 1; res["origin_spread_m"] = None
     res["ok"] = True
     return res

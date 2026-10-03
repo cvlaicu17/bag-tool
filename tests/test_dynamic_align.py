@@ -29,10 +29,10 @@ def test_recovers_yaw_and_lag():
             assert abs(r["lag_s"] - lag) <= 0.1, (lag, r["lag_s"])
 
 
-def test_translation_uses_the_pad_mean():
-    vt, vp, gt, gp = make_flight(seed=3); r = estimate_alignment(vt, vp, gt, gp); assert r["ok"] and "pad mean" in r["origin"]
+def test_translation_uses_the_first_five_seconds():
+    vt, vp, gt, gp = make_flight(seed=3); r = estimate_alignment(vt, vp, gt, gp); assert r["ok"] and "first 5 s" in r["origin"]
     R = np.array([[math.cos(-r["theta_rad"]), -math.sin(-r["theta_rad"]), 0], [math.sin(-r["theta_rad"]), math.cos(-r["theta_rad"]), 0], [0, 0, 1]])
-    pad = gt < 38; resid = np.linalg.norm((R @ gp[pad].T).T[:, :2] + r["trans"][:2] - vp[0, :2], axis=1)
+    pad = gt < 5; resid = np.linalg.norm((R @ gp[pad].T).T[:, :2] + r["trans"][:2] - vp[0, :2], axis=1)
     assert resid.mean() < 2.0                                            # GPS noise 1.2 m per axis, averaged over the pad
 
 

@@ -414,6 +414,7 @@ def compute_alignment(
     platform: PlatformConfig | None = None,
     yaw_rot: int = 0,
     align_method: str = 'first-fix',
+    align_origin_s: float = 5.0,
 ) -> tuple:
     """Load ground-truth + VIO data and compute raw + aligned trajectories.
 
@@ -582,17 +583,18 @@ def compute_alignment(
             from bag_tool.dynamic_align import estimate_alignment
             vf = _decode_posimus(posimus)
             dyn = estimate_alignment(np.array([sn for _, sn, _, _ in vf]) * 1e-9, np.array([p for _, _, p, _ in vf]),
-                                     np.array([sn for _, sn, _, _ in gps_records]) * 1e-9, np.array([p for _, _, p, _ in gps_records]))
+                                     np.array([sn for _, sn, _, _ in gps_records]) * 1e-9, np.array([p for _, _, p, _ in gps_records]),
+                                     origin_s=align_origin_s)
             if dyn['ok']:
                 lag_ns = int(round(dyn['lag_s'] * 1e9))
                 if lag_ns:
                     gps_records = [(ts, sn + lag_ns, p, r) for ts, sn, p, r in gps_records]
                 sd = f"{dyn['sd_deg']:.2f}" if dyn['sd_deg'] is not None else 'n/a'
                 print(f"Dynamic alignment: yaw (VIO world -> ENU) {math.degrees(dyn['theta_rad']):+.2f}° ± {sd}° (bootstrap), "
-                      f"{dyn['windows']} windows, coherence {dyn['coherence']:.2f}; GT stamps shifted by {dyn['lag_s']:+.2f} s; origin: {dyn['origin']}")
+                      f"{dyn['windows']} windows, coherence {dyn['coherence']:.2f}; GT stamps shifted by {dyn['lag_s']:+.2f} s; start position from the {dyn['origin']}")
                 LAST_ALIGN_INFO = {'align_method': 'dynamic', 'align_yaw_world_to_enu_deg': math.degrees(dyn['theta_rad']),
                                    'align_yaw_sd_deg': dyn['sd_deg'], 'align_gt_lag_s': dyn['lag_s'], 'align_windows': dyn['windows'],
-                                   'align_coherence': dyn['coherence']}
+                                   'align_coherence': dyn['coherence'], 'align_origin': dyn['origin'], 'align_origin_n': dyn['origin_n']}
             else:
                 reason = dyn['reason']
                 print(f"WARNING: dynamic alignment not possible ({reason}) -> falling back to first-fix"); dyn = None

@@ -58,6 +58,7 @@ def run(
     yaw_rot: int = 0,
     out_suffix: str = '',
     align_method: str = 'first-fix',
+    align_origin_s: float = 5.0,
 ) -> None:
     """Compute ground-truth ↔ VIO alignment from input_bag and write a new aligned bag next to it."""
     if platform is None:
@@ -101,7 +102,7 @@ def run(
     (out_poses, out_aligned, posimus, typestore, input_reader_path,
      input_start, input_end, diag_tracking, platform) = compute_alignment(
         input_bag, vio_topic, stores_enum,
-        aruco_yaw_rad=aruco_yaw_rad, platform=platform, yaw_rot=yaw_rot, align_method=align_method,
+        aruco_yaw_rad=aruco_yaw_rad, platform=platform, yaw_rot=yaw_rot, align_method=align_method, align_origin_s=align_origin_s,
     )
 
     suffix = f'_{out_suffix}' if out_suffix else ''

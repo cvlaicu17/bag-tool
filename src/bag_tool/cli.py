@@ -63,6 +63,7 @@ ALIGN_CONFIG_KEYS = {
     "rte_window": (int, float),
     "yaw_rot": int,
     "align_method": str,
+    "align_origin_s": (int, float),
     "out_suffix": str,
 }
 
@@ -229,6 +230,11 @@ def main() -> None:
              "dynamic: recover the yaw between the VIO and the ground-truth trajectories from the paths themselves "
              "(no heading needed; ~0.6° vs landmark truth; needs ~90 s of manoeuvring flight after take-off) and remove "
              "the GT-vs-VIO clock offset. Falls back to first-fix, with a warning, when it cannot be determined.",
+    )
+    align_parser.add_argument(
+        "--align-origin-s", type=float, default=5.0, metavar="SEC",
+        help="dynamic only: the start position is fixed from the first SEC seconds of ground truth (default 5, i.e. ~10 GPS fixes: "
+             "averages the GPS noise without turning the alignment into a flight-wide fit). 0 = the first fix only.",
     )
     align_parser.add_argument(
         "--out-suffix", default="", metavar="STR",
@@ -742,7 +748,7 @@ def main() -> None:
         run_align(args.input_bag, vio_topic, stores, ref_bag=args.ref_bag, quick=args.quick,
                   rte_window=args.rte_window, eval_mode=args.eval, manual=args.manual,
                   shrink=args.shrink, platform=platform, yaw_rot=args.yaw_rot,
-                  out_suffix=args.out_suffix, align_method=args.align_method)
+                  out_suffix=args.out_suffix, align_method=args.align_method, align_origin_s=args.align_origin_s)
         if getattr(args, "scale", False):
             from pathlib import Path as _P
             out = args.out_suffix or "_aligned"
