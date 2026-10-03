@@ -225,8 +225,9 @@ def main() -> None:
              "Use to compensate for unknown IMU mounting orientation in the sensor casket.",
     )
     align_parser.add_argument(
-        "--align-method", choices=["first-fix", "dynamic"], default="first-fix",
-        help="first-fix (default): align at the first fix with the vehicle heading / platform constant. "
+        "--align-method", choices=["first-fix", "dynamic"], default=None,
+        help="default: the platform's (altair: dynamic; prince, alexios: first-fix). "
+             "first-fix: align at the first fix with the vehicle heading / platform constant. "
              "dynamic: recover the yaw between the VIO and the ground-truth trajectories from the paths themselves "
              "(no heading needed; ~0.6° vs landmark truth; needs ~90 s of manoeuvring flight after take-off) and remove "
              "the GT-vs-VIO clock offset. Falls back to first-fix, with a warning, when it cannot be determined.",
@@ -745,10 +746,13 @@ def main() -> None:
             print(f"Platform    : {platform.name}")
         print()
 
+        method = args.align_method or platform.default_align_method
+        print(f"Align method: {method}" + ("" if args.align_method else f" (default of platform {platform.name})"))
         run_align(args.input_bag, vio_topic, stores, ref_bag=args.ref_bag, quick=args.quick,
                   rte_window=args.rte_window, eval_mode=args.eval, manual=args.manual,
                   shrink=args.shrink, platform=platform, yaw_rot=args.yaw_rot,
-                  out_suffix=args.out_suffix, align_method=args.align_method, align_origin_s=args.align_origin_s)
+                  out_suffix=args.out_suffix, align_method=method,
+                  align_origin_s=args.align_origin_s)
         if getattr(args, "scale", False):
             from pathlib import Path as _P
             out = args.out_suffix or "_aligned"

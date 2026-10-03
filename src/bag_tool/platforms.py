@@ -41,6 +41,9 @@ class PlatformConfig:
     # which lacks per-sample orientation and so picks up a different first-fix yaw
     # than the PoseStamped variant).
     yaw_correction_rad_by_msgtype: dict[str, float] = field(default_factory=dict)
+    # Alignment method used when --align-method is not given. 'dynamic' (bag_tool.dynamic_align) recovers the yaw between the VIO and the ground truth
+    # from the two paths, for platforms whose ground truth carries no usable heading; 'first-fix' needs the heading (RTK/ArUco yaw, or GT orientation).
+    default_align_method: str = 'first-fix'
 
 
 PLATFORMS: dict[str, PlatformConfig] = {
@@ -81,6 +84,7 @@ PLATFORMS: dict[str, PlatformConfig] = {
         #   up rotated very differently from the PoseStamped path. Mean of the two
         #   bags is -2.124658 rad relative to current -0.213286, so total = -2.337944.
         yaw_correction_rad=-0.213286,
+        default_align_method='dynamic',      # position-only FC/GPS ground truth, no heading: the first-fix constants only fit the Day20 take-off heading
         yaw_correction_rad_by_msgtype={
             'geometry_msgs/msg/PoseStamped':  -0.213286,
             'geometry_msgs/msg/PointStamped': -2.337944,
