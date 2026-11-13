@@ -41,10 +41,15 @@ from scipy.spatial.transform import Rotation, Slerp
 
 R_ITOC = {
     'alexios': np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
+    # JungleFlag forward camera (cam1, TRUE extrinsics): T_cam_imu rows [0,1,0],[0,0,1],[1,0,0]
+    'jungleflag_fwd': np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]]),
 }
 INTRINSICS = {
     'alexios': (1138.603, 1138.603, 640.0, 360.0),
+    'jungleflag_fwd': (1138.603, 1138.603, 640.0, 360.0),
 }
+# depth topic per platform (default DEPTH_T)
+DEPTH_TOPIC = {'jungleflag_fwd': '/camera/depth_fwd'}
 GT_T = '/pf_geo_loc/fc_local_position'
 FEAT_T = '/features/tracks'
 DEPTH_T = '/camera/depth'

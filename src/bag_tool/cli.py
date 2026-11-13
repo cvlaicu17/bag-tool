@@ -524,6 +524,15 @@ def main() -> None:
              "bucket, drift vs track age, gate quality vs truth; writes a score JSON.",
     )
     seval.add_argument("result_bag", help="Bag written by generate-tracker-gt")
+    sstab = sim_sub.add_parser(
+        "track-stability",
+        help="Pure-GT track consistency: triangulate every track from the tracker's pixels "
+             "with exact GT poses, reprojection residual per track (no depth images).",
+    )
+    sstab.add_argument("result_bag", help="Bag written by generate-tracker-gt")
+    sstab.add_argument("--platform", default="alexios", help="Camera platform constants")
+    sstab.add_argument("--out", default=None, help="Output prefix (default <bag>.stability)")
+    sstab.add_argument("--min-obs", type=int, default=3)
     seval.add_argument("--json", default=None, help="Score JSON path "
                        "(default: <result_bag>.tracker_score.json)")
 
@@ -860,9 +869,11 @@ def main() -> None:
             print(f"Saved default harmonic targets: {out_path}")
 
     elif args.command == "sim":
-        from bag_tool.sim_tracker import generate, evaluate
+        from bag_tool.sim_tracker import generate, evaluate, track_stability
         if args.sim_command == "generate-tracker-gt":
             generate(args.src_bag, args.out_bag, args.tracker_dump, args.platform)
+        elif args.sim_command == "track-stability":
+            track_stability(args.result_bag, args.platform, args.out, args.min_obs)
         else:
             evaluate(args.result_bag, args.json)
 

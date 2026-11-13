@@ -45,7 +45,7 @@ from rosbags.rosbag2.writer import StoragePlugin
 from rosbags.typesys import get_typestore
 from scipy.spatial.transform import Rotation, Slerp
 
-from bag_tool.graft import R_ITOC, INTRINSICS, GT_T, DEPTH_T, _mcap
+from bag_tool.graft import R_ITOC, INTRINSICS, GT_T, DEPTH_T, DEPTH_TOPIC, _mcap
 from bag_tool.ros2_detect import detect_stores_enum
 
 POINTS_T = '/tracker_eval/points'
@@ -123,7 +123,7 @@ def _bilinear(img, x, y):
             + img[y0 + 1, x0] * (1 - fx) * fy + img[y0 + 1, x0 + 1] * fx * fy)
 
 
-def _gt_points(px, py, dep_prev, dep_cur, Rr, tr, fx, fy, cx, cy, semantics):
+def _gt_points(px, py, dep_prev, dep_cur, Rr, tr, fx, fy, cx, cy, semantics, cur_xy=None):
     """Per-point GT endpoints + validity for prev pixels (px,py)."""
     d = _bilinear(dep_prev, px, py)
     okd = np.isfinite(d) & (d > 0.5)
@@ -154,7 +154,23 @@ def _gt_points(px, py, dep_prev, dep_cur, Rr, tr, fx, fy, cx, cy, semantics):
             occ = np.isfinite(ds) & (z1[m] - ds > OCCL_TOL_M)
             vi = np.where(m)[0][occ]
             validity[vi] = 3
-    return gu, gv, validity
+    # depth-stability extras (planar-Z metres): z_pred = depth the carried 3-D point has in the
+    # current frame; z_obs = depth image at the TRACKER's current pixel; spread = relative depth
+    # range (max-min)/centre in the 5x5 window around the previous pixel (>0.1: depth edge).
+    z_pred = z1.astype(np.float32)
+    if dep_cur is not None and cur_xy is not None:
+        z_obs = _bilinear(dep_cur, np.clip(cur_xy[:, 0], 0, W - 1.01), np.clip(cur_xy[:, 1], 0, H - 1.01))
+        if semantics == 'ray':
+            z_obs = z_obs / np.sqrt(((cur_xy[:, 0] - cx) / fx) ** 2 + ((cur_xy[:, 1] - cy) / fy) ** 2 + 1.0)
+        z_obs = z_obs.astype(np.float32)
+    else:
+        z_obs = np.full(len(px), np.nan, np.float32)
+    ix = np.clip(np.rint(px).astype(int), 2, W - 3)
+    iy = np.clip(np.rint(py).astype(int), 2, H - 3)
+    win = np.stack([dep_prev[iy + dy, ix + dx] for dy in range(-2, 3) for dx in range(-2, 3)], 1)
+    ctr = dep_prev[iy, ix]
+    spread = ((np.nanmax(win, 1) - np.nanmin(win, 1)) / np.maximum(ctr, 1e-3)).astype(np.float32)
+    return gu, gv, validity, z_pred, z_obs, spread
 
 
 # ---------------------------------------------------------------- generate
@@ -194,7 +210,10 @@ def generate(src_bag, out_bag, dump_path, platform='alexios'):
     gt_fields = [PF(name='u', offset=0, datatype=7, count=1),
                  PF(name='v', offset=4, datatype=7, count=1),
                  PF(name='id', offset=8, datatype=6, count=1),
-                 PF(name='validity', offset=12, datatype=2, count=1)]
+                 PF(name='validity', offset=12, datatype=2, count=1),
+                 PF(name='z_pred', offset=13, datatype=7, count=1),
+                 PF(name='z_obs', offset=17, datatype=7, count=1),
+                 PF(name='spread', offset=21, datatype=7, count=1)]
 
     out_path = Path(out_bag)
     if out_path.exists():
@@ -220,7 +239,8 @@ def generate(src_bag, out_bag, dump_path, platform='alexios'):
             c_pose = w.add_connection(GT_T, sc.msgtype, msgdef=mdp, rihs01=rihsp,
                                       serialization_format='cdr', offered_qos_profiles='')
 
-        conns = [c for c in r.connections if c.topic in (DEPTH_T, GT_T)]
+        depth_topic = DEPTH_TOPIC.get(platform, DEPTH_T)
+        conns = [c for c in r.connections if c.topic in (depth_topic, GT_T)]
         prev_depth = None    # (stamp, dep, semantics)
         pending = []         # records waiting for the NEXT depth (occlusion test)
         for c, t, raw in r.messages(connections=conns):
@@ -237,19 +257,19 @@ def generate(src_bag, out_bag, dump_path, platform='alexios'):
                 out = _score_record(rec, dprev, dep, sem, poses, R_bc, fx, fy, cx, cy)
                 if out is None:
                     continue
-                gu, gv, validity = out
+                gu, gv, validity, z_pred, z_obs, spread = out
                 n = len(ids)
                 b1 = bytearray()
                 b2 = bytearray()
                 for i in range(n):
                     b1 += struct.pack('<ffffIIB', xy[i, 2], xy[i, 3], xy[i, 0],
                                       xy[i, 1], ids[i], age[i], fate[i])
-                    b2 += struct.pack('<ffIB', gu[i], gv[i], ids[i], validity[i])
+                    b2 += struct.pack('<ffIBfff', gu[i], gv[i], ids[i], validity[i], z_pred[i], z_obs[i], spread[i])
                 tns = int(cur_t * 1e9)
                 w.write(c_pts, tns, ts.serialize_cdr(
                     cloud(cur_t, pts_fields, 25, b1, n), 'sensor_msgs/msg/PointCloud2'))
                 w.write(c_gt, tns, ts.serialize_cdr(
-                    cloud(cur_t, gt_fields, 13, b2, n), 'sensor_msgs/msg/PointCloud2'))
+                    cloud(cur_t, gt_fields, 25, b2, n), 'sensor_msgs/msg/PointCloud2'))
                 n_pairs += 1
                 for k in range(5):
                     vhist[k] += int((validity == k).sum())
@@ -284,7 +304,7 @@ def _score_record(rec, dep_prev, dep_cur, semantics, poses, R_bc, fx, fy, cx, cy
     Rr = Rwc1.T @ Rwc0
     tr = Rwc1.T @ (p0 - p1)
     return _gt_points(xy[:, 0], xy[:, 1], dep_prev, dep_cur, Rr, tr,
-                      fx, fy, cx, cy, semantics)
+                      fx, fy, cx, cy, semantics, cur_xy=xy[:, 2:4])
 
 
 # ---------------------------------------------------------------- evaluate
@@ -416,3 +436,106 @@ def evaluate(bag, json_out=None):
         json.dump(out, f, indent=1)
     print(f'score JSON -> {json_out}')
     return out
+
+
+# ---------------------------------------------------------------- track stability (GT poses only)
+def track_stability(bag, platform='alexios', out=None, min_obs=3):
+    """Pure-GT consistency of every track: triangulate it from the TRACKER's pixels with the
+    exact GT camera poses (multi-view midpoint least squares) and reproject into every view.
+    A track that follows one static 3-D point reprojects within tracker noise; one that slides
+    along a depth edge, hops between surfaces or follows a moving thing does not.  No depth
+    image is used, so the score is free of render artefacts (sub-pixel foliage speckle).
+    With little parallax any point fits: such tracks are reported as unobservable, not stable.
+
+    Writes <out>.npz (per track: id, n_obs, rms_px, max_px, parallax_deg, depth_m, behind,
+    X = GT-pose triangulated world point)
+    and prints the summary.  Observation set: the first pixel of every track (age 1 record,
+    prev pixel) + the current pixel of every KEPT record.
+    """
+    fx, fy, cx, cy = INTRINSICS[platform]
+    R_bc = R_ITOC[platform].T
+    ts = get_typestore(detect_stores_enum())
+    pdt = np.dtype({'names': ['u', 'v', 'pu', 'pv', 'id', 'age', 'fate'],
+                    'formats': ['<f4', '<f4', '<f4', '<f4', '<u4', '<u4', 'u1'],
+                    'offsets': [0, 4, 8, 12, 16, 20, 24], 'itemsize': 25})
+    rpath = Path(bag) if Path(bag).is_dir() else Path(_mcap(bag)).parent
+    stamps, chunks = [], []
+    with Reader(rpath) as r:
+        conns = [c for c in r.connections if c.topic == POINTS_T]
+        for c, t, raw in r.messages(connections=conns):
+            m = ts.deserialize_cdr(raw, c.msgtype)
+            stamps.append(m.header.stamp.sec + m.header.stamp.nanosec * 1e-9)
+            chunks.append(np.frombuffer(bytes(m.data), dtype=pdt, count=m.width))
+    o = np.argsort(stamps)
+    stamps = np.array(stamps)[o]
+    chunks = [chunks[i] for i in o]
+    poses = Poses(rpath)
+    # camera pose per frame index; frame k-1 is the prev frame of record k (consecutive pairs)
+    frame_t = np.concatenate([[stamps[0] - (stamps[1] - stamps[0])], stamps])
+    Rwc = np.zeros((len(frame_t), 3, 3)); C = np.zeros((len(frame_t), 3)); okf = np.zeros(len(frame_t), bool)
+    for k, tt in enumerate(frame_t):
+        P = poses.T_w_b(tt)
+        if P is None:
+            continue
+        Rwc[k] = P[0] @ R_bc; C[k] = P[1]; okf[k] = True
+    ids, fr, us, vs = [], [], [], []
+    for k, a in enumerate(chunks):            # record k: prev frame k, cur frame k+1
+        first = a['age'] == 1
+        ids.append(a['id'][first]); fr.append(np.full(first.sum(), k)); us.append(a['pu'][first]); vs.append(a['pv'][first])
+        kept = a['fate'] == 0
+        ids.append(a['id'][kept]); fr.append(np.full(kept.sum(), k + 1)); us.append(a['u'][kept]); vs.append(a['v'][kept])
+    ids = np.concatenate(ids); fr = np.concatenate(fr); us = np.concatenate(us).astype(np.float64); vs = np.concatenate(vs).astype(np.float64)
+    m = okf[fr]; ids, fr, us, vs = ids[m], fr[m], us[m], vs[m]
+    uid, ti = np.unique(ids, return_inverse=True)
+    nt = len(uid)
+    n = np.bincount(ti, minlength=nt)
+    # world rays
+    rc = np.stack([(us - cx) / fx, (vs - cy) / fy, np.ones_like(us)], 1)
+    rc /= np.linalg.norm(rc, axis=1, keepdims=True)
+    d = np.einsum('nij,nj->ni', Rwc[fr], rc)
+    c = C[fr]
+    # A = sum (I - d d^T), b = sum (I - d d^T) c  -- accumulated with bincount (memory-light)
+    A = np.zeros((nt, 3, 3)); b = np.zeros((nt, 3))
+    dc = np.einsum('ni,ni->n', d, c)
+    for i in range(3):
+        b[:, i] = np.bincount(ti, c[:, i] - d[:, i] * dc, minlength=nt)
+        for j in range(i, 3):
+            s = np.bincount(ti, d[:, i] * d[:, j], minlength=nt)
+            A[:, i, j] = (n if i == j else 0) - s
+            A[:, j, i] = A[:, i, j]
+    # parallax = angle between the first and last ray of the track
+    order = np.lexsort((fr, ti))
+    tis = ti[order]
+    firsts = order[np.r_[0, np.flatnonzero(np.diff(tis)) + 1]]
+    lasts = order[np.r_[np.flatnonzero(np.diff(tis)), len(tis) - 1]]
+    par = np.degrees(np.arccos(np.clip(np.einsum('ni,ni->n', d[firsts], d[lasts]), -1, 1)))
+    use = (n >= min_obs) & (np.abs(np.linalg.det(A)) > 1e-12)
+    X = np.full((nt, 3), np.nan)
+    X[use] = np.linalg.solve(A[use], b[use][..., None])[..., 0]
+    # reproject into every view
+    Xc = np.einsum('nji,nj->ni', Rwc[fr], X[ti] - c)
+    z = Xc[:, 2]
+    behind = z <= 0.05
+    eu = np.where(behind, np.nan, Xc[:, 0] / np.where(behind, 1, z) * fx + cx) - us
+    ev = np.where(behind, np.nan, Xc[:, 1] / np.where(behind, 1, z) * fy + cy) - vs
+    e2 = eu * eu + ev * ev
+    rms = np.sqrt(np.bincount(ti, np.nan_to_num(e2, nan=0.0), minlength=nt) / np.maximum(n, 1))
+    mx = np.zeros(nt); np.maximum.at(mx, ti, np.nan_to_num(np.sqrt(e2), nan=1e6))
+    nbh = np.bincount(ti, behind.astype(float), minlength=nt)
+    depth = np.einsum('ni,ni->n', X - C[fr[firsts]], d[firsts])
+    rms[~use] = np.nan; mx[~use] = np.nan
+    res = dict(id=uid, n_obs=n, rms_px=rms, max_px=mx, parallax_deg=par, depth_m=depth, behind=nbh,
+               X=X.astype(np.float32))
+    out = out or str(rpath) + '.stability'
+    np.savez_compressed(out + '.npz', **res)
+    # summary
+    print(f'[stability] {nt} tracks, {len(us)} observations, {use.sum()} with >= {min_obs} obs')
+    print('  parallax bucket      tracks   rms p50   rms p90   unstable(rms>1px)  unstable(max>3px)  behind')
+    for lo, hi in ((0, 0.5), (0.5, 1), (1, 2), (2, 5), (5, 180)):
+        k = use & (par >= lo) & (par < hi)
+        if not k.any():
+            continue
+        print(f'  {lo:4.1f}-{hi:5.1f} deg  {k.sum():9d}   {np.nanpercentile(rms[k], 50):7.2f}   {np.nanpercentile(rms[k], 90):7.2f}'
+              f'   {100 * np.mean(rms[k] > 1):14.1f}%   {100 * np.mean(mx[k] > 3):14.1f}%   {100 * np.mean(nbh[k] > 0):5.1f}%')
+    print(f'[stability] -> {out}.npz')
+    return res
