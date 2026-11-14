@@ -354,6 +354,25 @@ def main() -> None:
         help="End offset in seconds from the beginning of the bag.",
     )
 
+    # ---- index subcommand ----
+    index_parser = subparsers.add_parser(
+        "index",
+        help="Write indexed copies of a bag's MCAP files (mcap sort, or mcap merge into one) "
+             "so Foxglove can open them; lee_capture_node writes unindexed 2 GiB files.",
+    )
+    index_parser.add_argument("input_bag", help="Bag directory or .mcap file")
+    index_parser.add_argument(
+        "-o", "--output", default=None,
+        help="Output directory (default: <bag>/indexed/), or the output file with --merge "
+             "(default: <bag>_indexed.mcap next to the bag)",
+    )
+    index_parser.add_argument("--merge", action="store_true",
+                              help="Write one merged, indexed .mcap instead of one per file")
+    index_parser.add_argument("--mcap", default=None, metavar="PATH",
+                              help="mcap CLI binary (default: $MCAP_BIN, PATH, ~/bin/mcap)")
+    index_parser.add_argument("--force", action="store_true",
+                              help="Rewrite outputs that already exist")
+
     # ---- vib-check subcommand ----
     vibcheck_parser = subparsers.add_parser(
         "vib-check",
@@ -902,6 +921,10 @@ def main() -> None:
     elif args.command == "trim":
         print()
         run_trim(args.input_bag, args.output_bag, args.start, args.end)
+
+    elif args.command == "index":
+        from bag_tool.index import run as run_index
+        raise SystemExit(run_index(args.input_bag, args.output, args.merge, args.mcap, args.force))
 
     elif args.command == "vio-check":
         if args.platform == "auto":
