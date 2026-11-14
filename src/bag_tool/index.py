@@ -25,7 +25,8 @@ def find_mcap(explicit: str | None) -> str:
         if cand and Path(cand).is_file() and os.access(cand, os.X_OK):
             return cand
     sys.exit("ERROR: the mcap CLI was not found (PATH, ~/bin/mcap, $MCAP_BIN or --mcap).\n"
-             "  Download it from https://github.com/foxglove/mcap/releases (mcap-cli).")
+             "  Run ./install.sh (installs it to ~/bin/mcap) or download it from\n"
+             "  https://github.com/foxglove/mcap/releases (mcap-cli).")
 
 
 def _natural_key(p: Path):

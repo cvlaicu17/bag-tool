@@ -24,7 +24,7 @@ class PlatformConfig:
     # of the same sensor's output (e.g., altair supports both PoseStamped and
     # PointStamped flavors of /pf_geo_loc/fc_local_position).
     gps_msg_types: tuple[str, ...]
-    yaw_source: Literal['rtk_topic', 'pose_quaternion']
+    yaw_source: Literal['rtk_topic', 'pose_quaternion', 'mag_ground']
     yaw_topic: str | None
     coord_frame: Literal['geodetic', 'ned', 'enu']
     position_frame_offset_rad: float
@@ -44,6 +44,15 @@ class PlatformConfig:
     # Alignment method used when --align-method is not given. 'dynamic' (bag_tool.dynamic_align) recovers the yaw between the VIO and the ground truth
     # from the two paths, for platforms whose ground truth carries no usable heading; 'first-fix' needs the heading (RTK/ArUco yaw, or GT orientation).
     default_align_method: str = 'first-fix'
+    # mag_ground platforms (no heading in the GT): the yaw comes from the magnetometer on the
+    # ground. m_imu = mag_sign * R(mag_to_imu_rotvec) @ (m_uT - mag_hard_iron_ut), true north =
+    # magnetic north + mag_declination_deg (east positive). ground_window_s: the static window at
+    # the start of the VIO output (raven writes its pre-start static pose there, motors off).
+    mag_to_imu_rotvec: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    mag_hard_iron_ut: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    mag_sign: float = 1.0
+    mag_declination_deg: float = 0.0
+    ground_window_s: float = 5.0
 
 
 PLATFORMS: dict[str, PlatformConfig] = {
@@ -109,6 +118,35 @@ PLATFORMS: dict[str, PlatformConfig] = {
         aruco_supported=False,
         emit_raw_rtk_topics=False,
         yaw_correction_rad=0.0,
+    ),
+    # ezio rig (Jetson + lee_capture_node, little_eagle_msgs): u-blox NEO-M8N single antenna on
+    # /gnss/fix, no heading -> 'ground-mag' alignment: position = mean GNSS fix over the static
+    # ground window, yaw = IST8310 magnetometer (/mag/field) over the same window, tilt from the
+    # VIO's own gravity-aligned attitude. No trajectory fit.
+    # Magnetometer calibration (2026-11-14, ezio_mag_check.py on lee_2026-11-14_16-26-48 against
+    # raven's attitude): median residual 0.85 uT in flight / ~1 uT on the ground (~2.6 deg per uT
+    # of horizontal field); the IST8310 field reads sign-reversed in a right-handed fit (mag_sign
+    # -1). Ground yaw from it vs the GNSS-track yaw: within 1.4 deg on 16-26-48 (motors off) and
+    # 0-4 deg on 15-47-28 (calibration from the other flight). Armed motors on the ground disturb it
+    # by up to ~7 deg -> only the pre-arm window is used. Declination +5.9 deg (Timisoara, WMM 2026).
+    # RISK: hard iron changes when the rig's wiring/battery placement changes -> re-fit then.
+    'ezio': PlatformConfig(
+        name='ezio',
+        gps_topic='/gnss/fix',
+        gps_msg_types=('sensor_msgs/msg/NavSatFix',),
+        yaw_source='mag_ground',
+        yaw_topic='/mag/field',
+        coord_frame='geodetic',
+        position_frame_offset_rad=0.0,
+        detect_topics=('/gnss/fix', '/mag/field'),
+        aruco_supported=False,
+        emit_raw_rtk_topics=False,
+        default_align_method='ground-mag',
+        mag_to_imu_rotvec=(6.58352, 6.69978, -0.40537),
+        mag_hard_iron_ut=(-6.60, -2.73, -35.47),
+        mag_sign=-1.0,
+        mag_declination_deg=5.9,
+        ground_window_s=5.0,
     ),
 }
 

@@ -309,6 +309,59 @@ def _navsatfix_records(fixes, yaws):
     return records
 
 
+def _navsatfix_records_noyaw(fixes):
+    """NavSatFix lat/lon/alt -> ENU records about the first fix, identity orientation (no heading in the GT)."""
+    records = []
+    ref = None
+    for fix_ts, m in fixes:
+        if (m.latitude == 0.0 and m.longitude == 0.0) or not math.isfinite(m.latitude) or m.status.status < 0:
+            continue
+        if ref is None:
+            ref = (m.latitude, m.longitude, geodetic_to_ecef(m.latitude, m.longitude, m.altitude))
+            print(f'ENU origin set: lat={m.latitude:.7f} lon={m.longitude:.7f} alt={m.altitude:.3f}')
+        cx, cy, cz = geodetic_to_ecef(m.latitude, m.longitude, m.altitude)
+        enu = np.array(ecef_to_enu(cx - ref[2][0], cy - ref[2][1], cz - ref[2][2], ref[0], ref[1]))
+        stamp_ns = m.header.stamp.sec * 10**9 + m.header.stamp.nanosec or fix_ts
+        records.append((fix_ts, stamp_ns, enu, Rotation.identity()))
+    return records
+
+
+def ground_mag_alignment(vio, gps_records, mags, platform) -> dict:
+    """Yaw (VIO world -> ENU) and translation from the static ground window only: no trajectory fit.
+
+    Window = the first platform.ground_window_s of VIO output (raven: the pre-start static pose,
+    motors off). Magnetometer -> IMU frame with the platform calibration, rotated into the VIO world
+    with the VIO attitude (gravity-aligned roll/pitch), averaged; magnetic north = its horizontal
+    direction; true north = + declination. Translation maps the mean GNSS ground fix onto the mean
+    VIO ground position."""
+    t_v = np.array([sn for _, sn, _, _ in vio]); t0 = t_v[0]; t1 = t0 + int(platform.ground_window_s * 1e9)
+    iv = np.where(t_v <= t1)[0]
+    R_m = Rotation.from_rotvec(platform.mag_to_imu_rotvec); b = np.array(platform.mag_hard_iron_ut)
+    sel = (mags[:, 0] >= t0) & (mags[:, 0] <= t1)
+    if sel.sum() < 10:
+        raise ValueError(f'ground-mag: only {int(sel.sum())} magnetometer samples in the first {platform.ground_window_s} s of VIO output')
+    m_imu = platform.mag_sign * R_m.apply(mags[sel, 1:4] * 1e6 - b)
+    # VIO attitude at each mag sample (nearest pose)
+    j = np.clip(np.searchsorted(t_v, mags[sel, 0]), 0, len(vio) - 1)
+    m_w = np.array([vio[k][3].apply(v) for k, v in zip(j, m_imu)])
+    az = np.arctan2(m_w[:, 1], m_w[:, 0])                       # magnetic north in the VIO world, per sample
+    alpha = math.atan2(np.sin(az).mean(), np.cos(az).mean())
+    spread = math.degrees(np.sqrt(np.mean(np.angle(np.exp(1j * (az - alpha))) ** 2)))
+    theta = math.radians(90.0 - platform.mag_declination_deg) - alpha
+    theta = (theta + math.pi) % (2 * math.pi) - math.pi
+    g = np.array([p for _, sn, p, _ in gps_records if t0 <= sn <= t1])
+    if len(g) < 3:
+        raise ValueError(f'ground-mag: only {len(g)} GNSS fixes in the ground window')
+    p_gnss = g.mean(0); p_vio = np.mean([vio[k][2] for k in iv], axis=0)
+    trans = p_vio - Rotation.from_euler('z', -theta).apply(p_gnss)
+    print(f'Ground-mag alignment: yaw (VIO world -> ENU) {math.degrees(theta):+.2f} deg (mag spread {spread:.2f} deg, '
+          f'{int(sel.sum())} samples, decl {platform.mag_declination_deg:+.1f}); origin = mean of {len(g)} GNSS fixes '
+          f'(std {np.linalg.norm(g.std(0)[:2]):.2f} m horiz) over the first {platform.ground_window_s:.0f} s')
+    return {'ok': True, 'theta_rad': theta, 'trans': trans, 'lag_s': 0.0, 'yaw_spread_deg': spread,
+            'window_s': platform.ground_window_s, 'gnss_std_m': float(np.linalg.norm(g.std(0)[:2])),
+            'n_mag': int(sel.sum()), 'n_fix': int(len(g))}
+
+
 def _decode_posimus(posimus: list) -> list:
     """Decode raw VIO PoseWithCovarianceStamped messages into a uniform
     (bag_ts, stamp_ns, pos: np.ndarray, rot: Rotation) list.
@@ -445,6 +498,7 @@ def compute_alignment(
 
     fixes         = []  # NavSatFix path (prince)
     yaws          = []  # DJI yaw (prince)
+    mags          = []  # (stamp_ns, Bx, By, Bz) tesla (ezio, yaw_source mag_ground)
     gt_poses      = []  # PoseStamped path (altair-like, full pose)
     gt_points     = []  # PointStamped path (altair-like, position-only)
     posimus       = []
@@ -488,7 +542,11 @@ def compute_alignment(
                     )
             elif platform.yaw_topic is not None and topic == platform.yaw_topic:
                 msg = typestore.deserialize_cdr(rawdata, connection.msgtype)
-                yaws.append((timestamp, msg.data * 10.0))  # DJI publishes tenths-of-degrees
+                if platform.yaw_source == 'mag_ground':
+                    f_ = msg.magnetic_field
+                    mags.append((msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec, f_.x, f_.y, f_.z))
+                else:
+                    yaws.append((timestamp, msg.data * 10.0))  # DJI publishes tenths-of-degrees
             elif topic == vio_topic:
                 posimus.append((timestamp, typestore.deserialize_cdr(rawdata, connection.msgtype)))
             elif topic == '/ov_srvins/diag/tracking':
@@ -508,7 +566,10 @@ def compute_alignment(
     # Dispatch by which list is populated (driven by the actual bag's msgtype, not the
     # platform's default). A bag should contain only one of these — if both poses and
     # points exist, prefer poses (more information).
-    if fixes:
+    if fixes and platform.yaw_source == 'mag_ground':
+        print(f'Loaded {len(fixes)} fixes, {len(mags)} magnetometer samples, {len(posimus)} VIO poses')
+        gps_records = _navsatfix_records_noyaw(fixes)
+    elif fixes:
         if not yaws:
             print(f'WARNING: no {platform.yaw_topic} messages found — skipping ground-truth')
             fixes = []
@@ -576,6 +637,14 @@ def compute_alignment(
     global LAST_ALIGN_INFO
     LAST_ALIGN_INFO = {'align_method': 'first-fix'}
     dyn = None
+    if align_method == 'ground-mag':
+        if not (gps_records and posimus and mags):
+            raise ValueError('--align-method ground-mag needs GNSS fixes, VIO poses and magnetometer samples '
+                             f'(have {len(gps_records)}, {len(posimus)}, {len(mags)}); pass the magnetometer through to the result bag')
+        dyn = ground_mag_alignment(_decode_posimus(posimus), gps_records, np.array(mags), platform)
+        LAST_ALIGN_INFO = {'align_method': 'ground-mag', 'align_yaw_world_to_enu_deg': math.degrees(dyn['theta_rad']),
+                           'align_yaw_spread_deg': dyn['yaw_spread_deg'], 'align_ground_window_s': dyn['window_s'],
+                           'align_gnss_ground_std_m': dyn['gnss_std_m'], 'align_n_mag': dyn['n_mag'], 'align_n_fix': dyn['n_fix']}
     if align_method == 'dynamic':
         if not (gps_records and posimus):
             print('WARNING: --align-method dynamic needs ground truth and VIO poses -> using first-fix')

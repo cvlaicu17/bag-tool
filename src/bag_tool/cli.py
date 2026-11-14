@@ -225,12 +225,14 @@ def main() -> None:
              "Use to compensate for unknown IMU mounting orientation in the sensor casket.",
     )
     align_parser.add_argument(
-        "--align-method", choices=["first-fix", "dynamic"], default=None,
-        help="default: the platform's (altair: dynamic; prince, alexios: first-fix). "
+        "--align-method", choices=["first-fix", "dynamic", "ground-mag"], default=None,
+        help="default: the platform's (altair: dynamic; prince, alexios: first-fix; ezio: ground-mag). "
              "first-fix: align at the first fix with the vehicle heading / platform constant. "
              "dynamic: recover the yaw between the VIO and the ground-truth trajectories from the paths themselves "
              "(no heading needed; ~0.6° vs landmark truth; needs ~90 s of manoeuvring flight after take-off) and remove "
-             "the GT-vs-VIO clock offset. Falls back to first-fix, with a warning, when it cannot be determined.",
+             "the GT-vs-VIO clock offset. Falls back to first-fix, with a warning, when it cannot be determined. "
+             "ground-mag (ezio): position + yaw from the static ground window only -- mean GNSS fix and the calibrated "
+             "magnetometer (pass /mag/field through to the result bag); no trajectory fit.",
     )
     align_parser.add_argument(
         "--align-origin-s", type=float, default=5.0, metavar="SEC",
