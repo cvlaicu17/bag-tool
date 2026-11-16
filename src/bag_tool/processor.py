@@ -105,7 +105,8 @@ def rte_values_from_ate(
     ate_records: list[tuple[int, int, float]],
     rte_window_ns: int,
 ) -> list[float]:
-    """Compute per-frame RTE from ATE records. RTE = ATE(t) - ATE(t - window)."""
+    """Per-frame RTE-D from ATE records: |ATE(t)| - |ATE(t - window)| (the pre-2026-11-16 "RTE"; alignment-dependent).
+    RTE proper is bag_tool.trajectory.rte_relative_pose."""
     # Records may be 3-tuples (ts, stamp, ate) or 4-tuples with a trailing
     # error VECTOR (eval mode; used for segment-anchored phase ATE).
     ate_header_stamps = [r[1] for r in ate_records]
@@ -208,8 +209,11 @@ def detect_vertical_segments(fixes):
 
 
 def rms_jump_penalty(rte_values: list[float]) -> tuple[float, float]:
-    """Return (rms_rte, jump_penalty) from a list of per-frame RTE values."""
-    rte_arr = np.array(rte_values)
+    """Return (rms_rte, jump_penalty) from a list of per-frame RTE values (NaN = not scored, skipped)."""
+    rte_arr = np.array(rte_values, dtype=float)
+    rte_arr = rte_arr[np.isfinite(rte_arr)]
+    if not len(rte_arr):
+        return float('nan'), 0.0
     rms_rte = float(np.sqrt(np.mean(rte_arr ** 2)))
     if len(rte_arr) > 1:
         excess = np.maximum(0.0, np.abs(np.diff(rte_arr)) - JUMP_THRESHOLD)
@@ -234,7 +238,9 @@ COMPUTED_TOPICS = frozenset({
     '/ov_srvins/vio/path',
     '/ov_srvins/ate',
     '/ov_srvins/rte',
+    '/ov_srvins/rte_d',
     '/ov_srvins/eval_rms_rte',
+    '/ov_srvins/eval_rms_rte_d',
     '/ov_srvins/eval_jump_penalty',
     '/ov_srvins/eval_avg_slam_feats',
     '/ov_srvins/eval_ascent_ate',
@@ -245,6 +251,10 @@ COMPUTED_TOPICS = frozenset({
     '/ov_srvins/eval_cruise_rte',
     '/ov_srvins/eval_init_ate',
     '/ov_srvins/eval_init_rte',
+    '/ov_srvins/eval_ascent_rte_d',
+    '/ov_srvins/eval_descent_rte_d',
+    '/ov_srvins/eval_cruise_rte_d',
+    '/ov_srvins/eval_init_rte_d',
 })
 
 # NED→ENU is a proper rotation (det = +1, equivalent to 180° about the (1,1,0)/√2 axis).
@@ -362,6 +372,109 @@ def ground_mag_alignment(vio, gps_records, mags, platform) -> dict:
             'n_mag': int(sel.sum()), 'n_fix': int(len(g))}
 
 
+def _trajectory_from_records(out_aligned, out_poses, has_attitude, source, align_rot_pos, posimus, rte_window_ns):
+    """Legacy alignments (first-fix, dynamic, ground-mag) -> AlignedTrajectory. Positions are unchanged (ATE and RTE-D
+    are bit-identical to before). With a full-pose GT (PoseStamped) the attitude becomes the VIO body's attitude in the
+    VIO world: Rw * R_gt * Rx, Rw = the alignment's world yaw (the one applied to positions), R_gt = the raw GT
+    attitude, Rx = constant VIO body -> GT body rotation from a hand-eye on the relative rotations over rte_window.
+    Position-only GT keeps the legacy placeholder attitude and has_attitude False (RTE not scorable)."""
+    from bag_tool.trajectory import AlignedTrajectory, handeye_rotation, window_partner
+    from scipy.spatial.transform import Slerp
+    traj = AlignedTrajectory.from_records(out_aligned, has_attitude, source)
+    if not traj.has_attitude:
+        return traj
+    if len(traj) < 2 or align_rot_pos is None or not posimus or len(out_poses) != len(out_aligned):
+        traj.has_attitude = False
+        return traj
+    raw = align_rot_pos * Rotation.concatenate([r for _, _, _, r in out_poses])
+    vf = _decode_posimus(posimus)
+    t_v = np.array([sn for _, sn, _, _ in vf], np.int64); R_v = Rotation.concatenate([r for _, _, _, r in vf])
+    tg = traj.stamp_ns * 1e-9; tv = t_v * 1e-9
+    inside = (tv >= tg[0]) & (tv <= tg[-1])
+    Rg_v = Slerp(tg, raw)(np.clip(tv, tg[0], tg[-1]))
+    j = window_partner(t_v, rte_window_ns)
+    pair = inside & inside[j] & (j < np.arange(len(t_v)))
+    a = (R_v[j].inv() * R_v).as_rotvec(); b = (Rg_v[j].inv() * Rg_v).as_rotvec(); a[~pair] = np.nan
+    M, he = handeye_rotation(a, b)
+    traj.rot = raw * Rotation.from_matrix(M.T)
+    LAST_ALIGN_INFO.update({'body_handeye_angle_deg': he['handeye_angle_deg'], 'body_handeye_pairs': he['handeye_pairs']})
+    return traj
+
+
+def gnss_ins_alignment(vio, gt_bag, platform, mags=None, gps_records=None, rte_window_ns=1_000_000_000):
+    """'gnss-ins' alignment: the ground truth is a GNSS/INS smoother over the ORIGINAL recording (bag_tool.gnss_ins,
+    nothing from the VIO enters it), i.e. a full 6-DoF trajectory. Steps:
+      1. VIO body -> GT body rotation (constant; the VIO may run on another IMU of the rig): hand-eye on the
+         rotations each trajectory makes over rte_window.
+      2. World alignment from the ground window only (first platform.ground_window_s of VIO output, like ground-mag):
+         yaw = mean heading of Rg Rx Rv^T, i.e. the GNSS/INS heading instead of the magnetometer; translation maps
+         the mean GT position onto the mean VIO position. No trajectory fit.
+      3. Output: the whole GT trajectory as VIO-body poses in the VIO world, at platform.gnss_ins_out_hz.
+    Returns (AlignedTrajectory, out_poses (raw ENU records), info)."""
+    from bag_tool.gnss_ins import ground_truth
+    from bag_tool.trajectory import AlignedTrajectory, handeye_rotation, window_partner
+    from scipy.spatial.transform import Slerp
+    gt = ground_truth(gt_bag, platform.gt_imu_topic, platform.gt_pvt_topic)
+    tg = np.asarray(gt['t']); Rg_all = Rotation.from_quat(gt['q'])
+    slg = Slerp(tg, Rg_all)
+    t_v = np.array([sn for _, sn, _, _ in vio], np.int64); P_v = np.array([p for _, _, p, _ in vio])
+    R_v = Rotation.concatenate([r for _, _, _, r in vio])
+    tv = t_v * 1e-9
+    inside = (tv >= tg[0]) & (tv <= tg[-1])
+    if inside.sum() < 10:
+        raise ValueError(f'gnss-ins: the GNSS/INS ground truth ({tg[0]:.1f}..{tg[-1]:.1f}) does not cover the VIO output '
+                         f'({tv[0]:.1f}..{tv[-1]:.1f}); wrong --gt-bag?')
+    Rg_v = slg(np.clip(tv, tg[0], tg[-1]))
+    j = window_partner(t_v, rte_window_ns)
+    pair = inside & inside[j] & (j < np.arange(len(t_v)))
+    a = (R_v[j].inv() * R_v).as_rotvec(); b = (Rg_v[j].inv() * Rg_v).as_rotvec()
+    a[~pair] = np.nan
+    M, he = handeye_rotation(a, b)                              # a ~= M b ; Rx = M^T (VIO body -> GT body)
+    R_x = Rotation.from_matrix(M.T)
+    if he['handeye_angle_deg'] is None:
+        print(f"WARNING: gnss-ins: only {he['handeye_pairs']} rotations > 3 deg for the body hand-eye -> VIO body taken = GT body")
+    w = inside & (tv <= tv[0] + platform.ground_window_s)
+    if w.sum() < 3:
+        raise ValueError('gnss-ins: no VIO output inside the ground window covered by the ground truth')
+    A = Rg_v[w] * R_x * R_v[w].inv()                            # VIO world -> ENU, per ground sample
+    theta = float(np.angle(np.mean(np.exp(1j * A.as_euler('zyx')[:, 0]))))
+    Rw = Rotation.from_euler('z', -theta)                       # ENU -> VIO world
+    pg_w = np.stack([np.interp(tv[w], tg, gt['p'][:, c]) for c in range(3)], 1)
+    trans = P_v[w].mean(0) - Rw.apply(pg_w.mean(0))
+    # output trajectory
+    step = max(1, int(round(1.0 / np.median(np.diff(tg)) / platform.gnss_ins_out_hz)))
+    k = np.arange(0, len(tg), step)
+    stamp = np.round(tg[k] * 1e9).astype(np.int64)
+    off = int(np.median(np.array([bt for bt, _, _, _ in vio], np.int64) - t_v))   # header clock -> bag time
+    pos_al = Rw.apply(gt['p'][k]) + trans
+    rot_al = Rw * Rg_all[k] * R_x
+    traj = AlignedTrajectory(stamp + off, stamp, pos_al, rot_al, True, 'gnss-ins')
+    out_poses = [(int(stamp[i] + off), int(stamp[i]), gt['p'][kk] - gt['p'][k[0]], Rg_all[kk]) for i, kk in enumerate(k)]
+    sd_h = np.degrees(np.asarray(gt['sd_att'])[:, 2])
+    info = {'align_method': 'gnss-ins', 'align_yaw_world_to_enu_deg': math.degrees(theta),
+            'align_ground_window_s': platform.ground_window_s, 'gt_rate_hz': float(1.0 / np.median(np.diff(tg[k]))),
+            'gnss_ins_gnss_lag_s': float(gt['lag']), 'gnss_ins_seed_coherence': float(gt['seed_coherence']),
+            'gnss_ins_heading_sd_median_deg': float(np.median(sd_h)), 'gnss_ins_heading_sd_max_deg': float(sd_h.max()),
+            'gnss_ins_nis_vel': float(gt['nis_vel']), 'gnss_ins_nis_pos': float(gt['nis_pos']),
+            'body_handeye_angle_deg': he['handeye_angle_deg'], 'body_handeye_pairs': he['handeye_pairs'],
+            'body_handeye_resid_deg': he.get('handeye_resid_deg')}
+    print(f"GNSS/INS alignment: yaw (VIO world -> ENU) {math.degrees(theta):+.2f} deg from the GNSS/INS attitude over the first "
+          f"{platform.ground_window_s:.0f} s (heading sd median {np.median(sd_h):.2f}, max {sd_h.max():.2f} deg); VIO->GT body rotation "
+          f"{'n/a' if he['handeye_angle_deg'] is None else format(he['handeye_angle_deg'], '.2f')} deg (hand-eye, {he['handeye_pairs']} pairs"
+          f"{'' if he.get('handeye_resid_deg') is None else ', resid ' + format(he['handeye_resid_deg'], '.2f') + ' deg'}); "
+          f"GT {len(k)} poses at {info['gt_rate_hz']:.0f} Hz")
+    # magnetometer cross-check (ezio): how far the ground-mag heading is from the GNSS/INS one
+    if mags is not None and len(mags) and gps_records:
+        try:
+            gm = ground_mag_alignment(vio, gps_records, mags, platform)
+            d = (math.degrees(gm['theta_rad'] - theta) + 180) % 360 - 180
+            info['mag_heading_error_deg'] = d
+            print(f'Magnetometer heading check: ground-mag minus GNSS/INS = {d:+.2f} deg')
+        except ValueError as e:
+            print(f'Magnetometer heading check skipped: {e}')
+    return traj, out_poses, info
+
+
 def _decode_posimus(posimus: list) -> list:
     """Decode raw VIO PoseWithCovarianceStamped messages into a uniform
     (bag_ts, stamp_ns, pos: np.ndarray, rot: Rotation) list.
@@ -468,6 +581,8 @@ def compute_alignment(
     yaw_rot: int = 0,
     align_method: str = 'first-fix',
     align_origin_s: float = 5.0,
+    gt_bag: str | None = None,
+    rte_window_ns: int = 1_000_000_000,
 ) -> tuple:
     """Load ground-truth + VIO data and compute raw + aligned trajectories.
 
@@ -479,7 +594,8 @@ def compute_alignment(
     Returns (out_poses, out_aligned, posimus, typestore, reader_path,
              input_start_ns, input_end_ns, diag_tracking, platform).
     out_poses     : list of (gt_ts, stamp_ns, enu_pos, rot)    — raw ENU
-    out_aligned   : list of (gt_ts, stamp_ns, pos_al, rot_al)  — VIO-aligned
+    gt_traj       : AlignedTrajectory — the whole ground truth as VIO-body poses in the VIO world (every method
+                    returns a full trajectory; has_attitude says whether the attitude is real)
     posimus       : list of (timestamp_ns, msg)                — raw VIO poses
     typestore     : rosbags typestore (needed for Phase 3 serialisation)
     reader_path   : Path that was opened
@@ -563,6 +679,21 @@ def compute_alignment(
     gt_points.sort(key=lambda x: x[0])
     posimus.sort(key=lambda x: x[0])
 
+    global LAST_ALIGN_INFO
+    if align_method == 'gnss-ins':
+        if gt_bag is None:
+            raise ValueError(f"--align-method gnss-ins needs --gt-bag <original recording> (IMU {platform.gt_imu_topic} + "
+                             f"PVT {platform.gt_pvt_topic}); use --align-method ground-mag for the magnetometer alignment")
+        if not posimus:
+            raise ValueError('gnss-ins: no VIO poses')
+        vf = _decode_posimus(posimus)
+        recs = _navsatfix_records_noyaw(fixes) if fixes else []
+        traj, out_poses, info = gnss_ins_alignment(vf, gt_bag, platform, np.array(mags) if mags else None, recs, rte_window_ns)
+        LAST_ALIGN_INFO = info
+        print(f'Emitted {len(out_poses)} ground-truth poses, {len(traj)} aligned poses')
+        return (out_poses, traj, posimus, typestore, reader_path,
+                input_start_ns, input_end_ns, diag_tracking, platform)
+
     # Dispatch by which list is populated (driven by the actual bag's msgtype, not the
     # platform's default). A bag should contain only one of these — if both poses and
     # points exist, prefer poses (more information).
@@ -634,7 +765,6 @@ def compute_alignment(
         print(f'Skipped {n_skipped_for_init} invalid leading VIO frame(s) before finding init pose')
 
     # Dynamic alignment (no heading): rotation + clock offset + origin from the two trajectories.
-    global LAST_ALIGN_INFO
     LAST_ALIGN_INFO = {'align_method': 'first-fix'}
     dyn = None
     if align_method == 'ground-mag':
@@ -730,7 +860,10 @@ def compute_alignment(
             out_aligned.append((gt_ts, stamp_ns, p_al, Rotation.from_quat(q_al_arr)))
 
     print(f'Emitted {len(out_poses)} ground-truth poses, {len(out_aligned)} aligned poses')
-    return (out_poses, out_aligned, posimus, typestore, reader_path,
+    gt_traj = _trajectory_from_records(out_aligned, out_poses, has_attitude=bool(gt_poses) and not fixes,
+                                       source='pose' if gt_poses else ('point' if gt_points else 'gnss-fix'),
+                                       align_rot_pos=align_rot_pos, posimus=posimus, rte_window_ns=rte_window_ns)
+    return (out_poses, gt_traj, posimus, typestore, reader_path,
             input_start_ns, input_end_ns, diag_tracking, platform)
 
 
@@ -741,7 +874,7 @@ def write_alignment_topics(
     writer,
     typestore,
     out_poses: list,
-    out_aligned: list,
+    gt_traj,
     posimus: list,
     quick: bool,
     ts_offset: int = 0,
@@ -751,7 +884,13 @@ def write_alignment_topics(
     shrink: bool = False,
     platform: PlatformConfig | None = None,
 ) -> None:
-    """Register computed alignment connections and write all their messages."""
+    """Register computed alignment connections and write all their messages.
+
+    gt_traj: AlignedTrajectory from compute_alignment (the alignment's full GT trajectory in the VIO world). The scorer
+    compares it with the VIO trajectory: ATE, RTE-D (the |ATE| rate, formerly "RTE") and RTE (frame-invariant
+    relative-pose drift over rte_window; needs gt_traj.has_attitude, NaN otherwise). See bag_tool.trajectory."""
+    from bag_tool.trajectory import rte_relative_pose
+    out_aligned = gt_traj.records()
 
     if platform is None:
         platform = PLATFORMS['prince']
@@ -822,6 +961,8 @@ def write_alignment_topics(
         conn_vio_pose      = _computed_conn('/ov_srvins/vio/pose',            POSE_TYPE)
         conn_rte           = _computed_conn('/ov_srvins/rte',                 'std_msgs/msg/Float64')
         conn_rms_rte       = _computed_conn('/ov_srvins/eval_rms_rte',        'std_msgs/msg/Float64')
+        conn_rte_d         = _computed_conn('/ov_srvins/rte_d',               'std_msgs/msg/Float64')
+        conn_rms_rte_d     = _computed_conn('/ov_srvins/eval_rms_rte_d',      'std_msgs/msg/Float64')
         conn_jump_penalty  = _computed_conn('/ov_srvins/eval_jump_penalty',   'std_msgs/msg/Float64')
         conn_avg_slam      = _computed_conn('/ov_srvins/eval_avg_slam_feats', 'std_msgs/msg/Float64')
 
@@ -861,6 +1002,7 @@ def write_alignment_topics(
             posimus       = [(ts, pm) for ts, pm in posimus
                              if pm.header.stamp.sec * 10**9 + pm.header.stamp.nanosec <= landing_stamp_ns]
             out_aligned   = [(ft, sn, p, r) for ft, sn, p, r in out_aligned if sn <= landing_stamp_ns]
+            gt_traj       = gt_traj.until(landing_stamp_ns)
             if diag_tracking:
                 diag_tracking = [(h, c) for h, c in diag_tracking if h <= landing_stamp_ns]
             n_dropped = n_before - len(posimus)
@@ -892,6 +1034,7 @@ def write_alignment_topics(
                 ate_records.append((vio_ts, vio_stamp_ns, float(np.linalg.norm(err)), err))
 
             # VIO-failure extension: if VIO stopped before landing, freeze last position.
+            pose_recs = [(pos, rot) for _, _, pos, rot in vio_frames]
             n_frozen = 0
             if vio_frames and landing_stamp_ns is not None:
                 last_vio_stamp_ns = vio_frames[-1][1]
@@ -903,21 +1046,35 @@ def write_alignment_topics(
                             continue
                         err = frozen_pos - al_positions[_nearest_al_eval(stamp_ns)]
                         ate_records.append((fix_ts, stamp_ns, float(np.linalg.norm(err)), err))
+                        pose_recs.append((frozen_pos, frozen_rot))
                         writer.write(conn_vio_pose, fix_ts + ts_offset, typestore.serialize_cdr(
                             make_pose_msg(stamp_ns, FRAME_ID, frozen_pos, frozen_rot), POSE_TYPE))
                         n_frozen += 1
                     if n_frozen:
                         print(f'VIO failure detected — {n_frozen} frozen frames appended to landing')
 
-            rte_values = rte_values_from_ate(ate_records, rte_window_ns)
-            for rec, rte in zip(ate_records, rte_values):
+            # RTE-D: the |ATE| rate (the pre-2026-11-16 "RTE"), alignment-dependent. RTE: frame-invariant drift.
+            rte_d_values = rte_values_from_ate(ate_records, rte_window_ns)
+            rec_stamps = np.array([rec[1] for rec in ate_records], np.int64)
+            rte_values = [float(x) for x in rte_relative_pose(
+                rec_stamps, np.array([p for p, _ in pose_recs], float), Rotation.concatenate([r for _, r in pose_recs]),
+                gt_traj, rte_window_ns)]
+            for rec, rte, rte_d in zip(ate_records, rte_values, rte_d_values):
                 vio_ts = rec[0]
                 writer.write(conn_rte, vio_ts + ts_offset, _ENCAP + struct.pack('<d', rte))
-            rms_rte, jump_penalty = rms_jump_penalty(rte_values)
+                writer.write(conn_rte_d, vio_ts + ts_offset, _ENCAP + struct.pack('<d', rte_d))
+            rms_rte, _ = rms_jump_penalty(rte_values)
+            rms_rte_d, jump_penalty = rms_jump_penalty(rte_d_values)     # jump penalty: on RTE-D, as before
+            n_rte = int(np.isfinite(rte_values).sum())
             first_ts = ate_records[0][0]
             writer.write(conn_rms_rte,      first_ts + ts_offset, _ENCAP + struct.pack('<d', rms_rte))
+            writer.write(conn_rms_rte_d,    first_ts + ts_offset, _ENCAP + struct.pack('<d', rms_rte_d))
             writer.write(conn_jump_penalty, first_ts + ts_offset, _ENCAP + struct.pack('<d', jump_penalty))
-            print(f'RMS RTE      : {rms_rte:.4f} m')
+            if gt_traj.has_attitude:
+                print(f'RMS RTE      : {rms_rte:.4f} m  (1-s relative-pose drift, {n_rte}/{len(ate_records)} frames, GT {gt_traj.source})')
+            else:
+                print(f'RMS RTE      : n/a  (ground truth {gt_traj.source} has no attitude; use an alignment with a full-pose GT)')
+            print(f'RMS RTE-D    : {rms_rte_d:.4f} m  (|ATE| rate, alignment-dependent)')
             # whole-flight ATE (first-fix aligned, the same per-fix errors as the /ate topic)
             _ate = np.array([rec[2] for rec in ate_records])
             rms_ate, max_ate = float(np.sqrt(np.mean(_ate ** 2))), float(_ate.max())
@@ -974,27 +1131,31 @@ def write_alignment_topics(
                       ('descent', [(a, b) for d_, a, b in segments if d_ == 'descent']),
                       ('cruise', cruise_iv)]
             for name, ivs in phases:
-                vals_ate = []; vals_rte = []
+                vals_ate = []; vals_rte = []; vals_rte_d = []
                 for a, b in ivs:
                     idx = [k for k, rec in enumerate(ate_records) if a <= rec[1] <= b]
                     if not idx:
                         continue
                     ref = ate_records[idx[0]][3]        # error vector at segment start
                     vals_ate += [float(np.linalg.norm(ate_records[k][3] - ref)) for k in idx]
-                    vals_rte += [rte_values[k] for k in idx]
+                    vals_rte += [rte_values[k] for k in idx if np.isfinite(rte_values[k])]
+                    vals_rte_d += [rte_d_values[k] for k in idx]
                 if not vals_ate:
                     continue
                 p_ate = float(np.sqrt(np.mean(np.square(vals_ate))))
-                p_rte = float(np.sqrt(np.mean(np.square(vals_rte))))
+                p_rte = float(np.sqrt(np.mean(np.square(vals_rte)))) if vals_rte else float('nan')
+                p_rte_d = float(np.sqrt(np.mean(np.square(vals_rte_d))))
                 phase_metrics[f'{name}_ate'] = p_ate
-                phase_metrics[f'{name}_rte'] = p_rte
+                phase_metrics[f'{name}_rte'] = p_rte if math.isfinite(p_rte) else None
+                phase_metrics[f'{name}_rte_d'] = p_rte_d
                 phase_metrics[f'{name}_segments'] = len(ivs)
                 dur = sum((b - a) for a, b in ivs) / 1e9
                 print(f'{name.capitalize():7s} ({len(ivs)} seg, {dur:.0f}s): '
-                      f'ATE {p_ate:.3f} m  RTE {p_rte:.4f} m   (segment-anchored)')
+                      f'ATE {p_ate:.3f} m  RTE {p_rte:.4f} m  RTE-D {p_rte_d:.4f} m   (segment-anchored)')
                 first_ts = ate_records[0][0]
                 for key, val in ((f'/ov_srvins/eval_{name}_ate', p_ate),
-                                 (f'/ov_srvins/eval_{name}_rte', p_rte)):
+                                 (f'/ov_srvins/eval_{name}_rte', p_rte),
+                                 (f'/ov_srvins/eval_{name}_rte_d', p_rte_d)):
                     conn = _computed_conn(key, 'std_msgs/msg/Float64')
                     writer.write(conn, first_ts + ts_offset, _ENCAP + struct.pack('<d', val))
             if not segments:
@@ -1006,7 +1167,9 @@ def write_alignment_topics(
             else:
                 avg_slam_feats = None
                 print('WARNING: diag/tracking not in bag — avg_slam_feats skipped')
-            metrics: dict = {'rms_rte': rms_rte, 'rms_ate': rms_ate, 'max_ate': max_ate, 'jump_penalty': jump_penalty,
+            metrics: dict = {'rms_rte': rms_rte if math.isfinite(rms_rte) else None, 'rms_rte_d': rms_rte_d,
+                             'rms_ate': rms_ate, 'max_ate': max_ate, 'jump_penalty': jump_penalty,
+                             'rte_frames': n_rte, 'gt_source': gt_traj.source, 'gt_has_attitude': gt_traj.has_attitude,
                              **phase_metrics, **LAST_ALIGN_INFO}
             if avg_slam_feats is not None:
                 metrics['avg_slam_feats'] = avg_slam_feats
@@ -1024,6 +1187,7 @@ def write_alignment_topics(
     conn_vio_path = None if no_paths else _computed_conn('/ov_srvins/vio/path',        PATH_TYPE)
     conn_ate      = None if quick    else _computed_conn('/ov_srvins/ate', 'std_msgs/msg/Float64')
     conn_rte      = None if quick    else _computed_conn('/ov_srvins/rte', 'std_msgs/msg/Float64')
+    conn_rte_d    = None if quick    else _computed_conn('/ov_srvins/rte_d', 'std_msgs/msg/Float64')
 
     if quick:
         for fix_ts, stamp_ns, pos, rot in out_aligned:
@@ -1046,13 +1210,19 @@ def write_alignment_topics(
                                  _path_header_cdr(stamp_ns, k) + bytes(rtk_buf))
 
         al_buf = bytearray()
+        # a cumulative Path per sample grows quadratically: high-rate GT (gnss-ins, 50 Hz) is pathed at <= ~5 Hz
+        path_every = 1
+        if len(out_aligned) > 2:
+            hz = 1e9 / float(np.median(np.diff([sn for _, sn, _, _ in out_aligned])))
+            path_every = max(1, int(round(hz / 5.0)))
+        n_path = 0
         for k, (fix_ts, stamp_ns, pos, rot) in enumerate(out_aligned, 1):
             writer.write(conn_pose_al, fix_ts + ts_offset, typestore.serialize_cdr(
                 make_pose_msg(stamp_ns, FRAME_ID, pos, rot), POSE_TYPE))
-            if conn_path_al is not None:
-                al_buf.extend(_pose_cdr_bytes(stamp_ns, pos, rot.as_quat()))
+            if conn_path_al is not None and (k - 1) % path_every == 0:
+                al_buf.extend(_pose_cdr_bytes(stamp_ns, pos, rot.as_quat())); n_path += 1
                 writer.write(conn_path_al, fix_ts + ts_offset,
-                             _path_header_cdr(stamp_ns, k) + bytes(al_buf))
+                             _path_header_cdr(stamp_ns, n_path) + bytes(al_buf))
 
         vio_frames = _decode_posimus(posimus)
 
@@ -1087,9 +1257,13 @@ def write_alignment_topics(
             ate_records.append((vio_ts, vio_stamp_ns, ate))
             writer.write(conn_ate, vio_ts + ts_offset, _ENCAP + struct.pack('<d', ate))
 
-        # Second pass: RTE = ate(t) - ate(t - rte_window_ns), using header stamps for the window.
-        for (vio_ts, _, _), rte in zip(ate_records, rte_values_from_ate(ate_records, rte_window_ns)):
-            writer.write(conn_rte, vio_ts + ts_offset, _ENCAP + struct.pack('<d', rte))
+        # Second pass: RTE-D = ate(t) - ate(t - rte_window_ns); RTE = frame-invariant relative-pose drift (NaN without GT attitude)
+        from bag_tool.trajectory import rte_relative_pose
+        rte = rte_relative_pose(np.array([sn for _, sn, _, _ in vio_frames], np.int64), np.array([p for _, _, p, _ in vio_frames]),
+                                Rotation.concatenate([r for _, _, _, r in vio_frames]), gt_traj, rte_window_ns)
+        for (vio_ts, _, _), rte_d, r in zip(ate_records, rte_values_from_ate(ate_records, rte_window_ns), rte):
+            writer.write(conn_rte_d, vio_ts + ts_offset, _ENCAP + struct.pack('<d', rte_d))
+            writer.write(conn_rte, vio_ts + ts_offset, _ENCAP + struct.pack('<d', float(r)))
 
 
 # ---------------------------------------------------------------------------
@@ -1110,7 +1284,7 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
     _posimus.sort(key=lambda x: x[0])
     aruco_yaw_rad = detect_aruco_north(_reader_path_conv, _posimus, _store)
 
-    (out_poses, out_aligned, posimus, typestore, reader_path,
+    (out_poses, gt_traj, posimus, typestore, reader_path,
      _, _, diag_tracking, platform) = compute_alignment(
         input_bag, vio_topic, stores_enum, aruco_yaw_rad=aruco_yaw_rad,
     )
@@ -1121,7 +1295,7 @@ def run(input_bag: str, output_bag: str, vio_topic: str, stores_enum, quick: boo
         sys.exit(1)
 
     with Writer(out_dir, version=9, storage_plugin=StoragePlugin.MCAP) as writer:
-        write_alignment_topics(writer, typestore, out_poses, out_aligned, posimus, quick,
+        write_alignment_topics(writer, typestore, out_poses, gt_traj, posimus, quick,
                                eval_mode=eval_mode, diag_tracking=diag_tracking,
                                platform=platform)
 

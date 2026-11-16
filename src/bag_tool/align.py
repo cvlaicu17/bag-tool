@@ -59,6 +59,7 @@ def run(
     out_suffix: str = '',
     align_method: str = 'first-fix',
     align_origin_s: float = 5.0,
+    gt_bag: str | None = None,
 ) -> None:
     """Compute ground-truth ↔ VIO alignment from input_bag and write a new aligned bag next to it."""
     if platform is None:
@@ -99,10 +100,11 @@ def run(
             cam_to_vio_ts_offset=cam_to_vio_ts_offset,
         )
 
-    (out_poses, out_aligned, posimus, typestore, input_reader_path,
+    (out_poses, gt_traj, posimus, typestore, input_reader_path,
      input_start, input_end, diag_tracking, platform) = compute_alignment(
         input_bag, vio_topic, stores_enum,
         aruco_yaw_rad=aruco_yaw_rad, platform=platform, yaw_rot=yaw_rot, align_method=align_method, align_origin_s=align_origin_s,
+        gt_bag=gt_bag, rte_window_ns=int(rte_window * 1e9),
     )
 
     suffix = f'_{out_suffix}' if out_suffix else ''
@@ -113,7 +115,7 @@ def run(
 
     with Reader(input_reader_path) as input_reader:
         with Writer(out_path, version=9, storage_plugin=StoragePlugin.MCAP) as writer:
-            metrics = write_alignment_topics(writer, typestore, out_poses, out_aligned, posimus, quick,
+            metrics = write_alignment_topics(writer, typestore, out_poses, gt_traj, posimus, quick,
                                              ts_offset=ts_offset,
                                              rte_window_ns=int(rte_window * 1e9),
                                              eval_mode=eval_mode,

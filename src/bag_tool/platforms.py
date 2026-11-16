@@ -53,6 +53,12 @@ class PlatformConfig:
     mag_sign: float = 1.0
     mag_declination_deg: float = 0.0
     ground_window_s: float = 5.0
+    # 'gnss-ins' alignment: the ground truth is a GNSS/INS smoother over the ORIGINAL recording (align --gt-bag),
+    # gt_imu_topic (sensor_msgs/Imu) + gt_pvt_topic (lat/lon/height, NED Doppler velocity, h/v accuracy); the full
+    # 6-DoF GT trajectory is emitted at gnss_ins_out_hz.
+    gt_imu_topic: str | None = None
+    gt_pvt_topic: str | None = None
+    gnss_ins_out_hz: float = 50.0
 
 
 PLATFORMS: dict[str, PlatformConfig] = {
@@ -141,12 +147,17 @@ PLATFORMS: dict[str, PlatformConfig] = {
         detect_topics=('/gnss/fix', '/mag/field'),
         aruco_supported=False,
         emit_raw_rtk_topics=False,
-        default_align_method='ground-mag',
+        default_align_method='gnss-ins',
         mag_to_imu_rotvec=(6.58352, 6.69978, -0.40537),
         mag_hard_iron_ut=(-6.60, -2.73, -35.47),
         mag_sign=-1.0,
         mag_declination_deg=5.9,
         ground_window_s=5.0,
+        # default alignment 'gnss-ins' (2026-11-16): GNSS/INS smoother on the ICM-42688 (best gyro) + u-blox PVT from the
+        # recording -> full-pose GT (RTE scorable) and a GNSS/INS heading instead of the magnetometer. 'ground-mag' (the
+        # previous default) stays available; it gives a position-only GT (RTE n/a, RTE-D only).
+        gt_imu_topic='/imu2/data_raw',
+        gt_pvt_topic='/gnss/pvt',
     ),
 }
 

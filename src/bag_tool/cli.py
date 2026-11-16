@@ -167,6 +167,11 @@ def main() -> None:
         help="Compute RTK-VIO alignment and write aligned bag next to the input.",
     )
     align_parser.add_argument("input_bag", help="Bag with RTK + VIO data to align")
+    align_parser.add_argument(
+        "--gt-bag", default=None,
+        help="Original recording, for --align-method gnss-ins: its IMU + GNSS PVT are smoothed into a full-pose "
+             "ground truth (cached per recording, ~/.cache/bag-tool/gnss_ins).",
+    )
     align_parser.add_argument("ref_bag", nargs="?", default=None,
                               help="Optional reference bag used only for timestamp alignment "
                                    "(e.g. the original DJI recording)")
@@ -225,8 +230,12 @@ def main() -> None:
              "Use to compensate for unknown IMU mounting orientation in the sensor casket.",
     )
     align_parser.add_argument(
-        "--align-method", choices=["first-fix", "dynamic", "ground-mag"], default=None,
-        help="default: the platform's (altair: dynamic; prince, alexios: first-fix; ezio: ground-mag). "
+        "--align-method", choices=["first-fix", "dynamic", "ground-mag", "gnss-ins"], default=None,
+        help="default: the platform's (altair: dynamic; prince, alexios: first-fix; ezio: gnss-ins). "
+             "Every method outputs the whole ground truth as a trajectory in the VIO frame; the scorer then computes "
+             "ATE, RTE (1-s relative-pose drift; needs a ground truth with attitude) and RTE-D (the |ATE| rate). "
+             "gnss-ins (ezio): GNSS/INS smoother over the original recording (--gt-bag) -> full-pose ground truth; "
+             "position from the ground window, heading from the GNSS/INS attitude (no magnetometer, no fit). "
              "first-fix: align at the first fix with the vehicle heading / platform constant. "
              "dynamic: recover the yaw between the VIO and the ground-truth trajectories from the paths themselves "
              "(no heading needed; ~0.6° vs landmark truth; needs ~90 s of manoeuvring flight after take-off) and remove "
@@ -782,7 +791,7 @@ def main() -> None:
                   rte_window=args.rte_window, eval_mode=args.eval, manual=args.manual,
                   shrink=args.shrink, platform=platform, yaw_rot=args.yaw_rot,
                   out_suffix=args.out_suffix, align_method=method,
-                  align_origin_s=args.align_origin_s)
+                  align_origin_s=args.align_origin_s, gt_bag=args.gt_bag)
         if getattr(args, "scale", False):
             from pathlib import Path as _P
             out = args.out_suffix or "_aligned"

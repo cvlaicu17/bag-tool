@@ -1,4 +1,5 @@
-"""eval: compute RTE metrics from an already-aligned MCAP bag."""
+"""eval: compute RTE-D (the |ATE| rate, formerly "RTE") from an already-aligned MCAP bag. The aligned bag does not
+record whether the GT attitude is real, so the frame-invariant RTE is only computed by `align --eval`."""
 
 from __future__ import annotations
 
@@ -69,5 +70,5 @@ def run(input_bag: str, stores_enum, rte_window_ns: int = 1_000_000_000) -> None
 
     rte_values = rte_values_from_ate(ate_records, rte_window_ns)
     rms_rte, jump_penalty = rms_jump_penalty(rte_values)
-    print(f'RMS RTE      : {rms_rte:.4f} m')
+    print(f'RMS RTE-D    : {rms_rte:.4f} m  (|ATE| rate; RTE proper: bag-tool align --eval)')
     print(f'Jump penalty : {jump_penalty:.4f} m  (threshold={JUMP_THRESHOLD}m)')
