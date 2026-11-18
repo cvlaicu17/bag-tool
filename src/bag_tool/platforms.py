@@ -59,6 +59,9 @@ class PlatformConfig:
     gt_imu_topic: str | None = None
     gt_pvt_topic: str | None = None
     gnss_ins_out_hz: float = 50.0
+    # gnss-ins height source: 'gnss' = receiver altitude in the position update; 'doppler' = horizontal position only,
+    # height from the Doppler vertical velocity (align --gt-height overrides)
+    gnss_ins_height: str = 'gnss'
 
 
 PLATFORMS: dict[str, PlatformConfig] = {
@@ -158,6 +161,9 @@ PLATFORMS: dict[str, PlatformConfig] = {
         # previous default) stays available; it gives a position-only GT (RTE n/a, RTE-D only).
         gt_imu_topic='/imu2/data_raw',
         gt_pvt_topic='/gnss/pvt',
+        # GT height from the Doppler vertical velocity (2026-11-19): the M8N receiver altitude slips (ended 5.5 m below
+        # take-off on 16-26-48 while baro, Doppler height and the VIO all agreed on ~0) -> fake VIO vertical drift.
+        gnss_ins_height='doppler',
     ),
 }
 

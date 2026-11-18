@@ -401,7 +401,7 @@ def _trajectory_from_records(out_aligned, out_poses, has_attitude, source, align
     return traj
 
 
-def gnss_ins_alignment(vio, gt_bag, platform, mags=None, gps_records=None, rte_window_ns=1_000_000_000):
+def gnss_ins_alignment(vio, gt_bag, platform, mags=None, gps_records=None, rte_window_ns=1_000_000_000, height=None):
     """'gnss-ins' alignment: the ground truth is a GNSS/INS smoother over the ORIGINAL recording (bag_tool.gnss_ins,
     nothing from the VIO enters it), i.e. a full 6-DoF trajectory. Steps:
       1. VIO body -> GT body rotation (constant; the VIO may run on another IMU of the rig): hand-eye on the
@@ -414,7 +414,8 @@ def gnss_ins_alignment(vio, gt_bag, platform, mags=None, gps_records=None, rte_w
     from bag_tool.gnss_ins import ground_truth
     from bag_tool.trajectory import AlignedTrajectory, handeye_rotation, window_partner
     from scipy.spatial.transform import Slerp
-    gt = ground_truth(gt_bag, platform.gt_imu_topic, platform.gt_pvt_topic)
+    height = height or platform.gnss_ins_height
+    gt = ground_truth(gt_bag, platform.gt_imu_topic, platform.gt_pvt_topic, height=height)
     tg = np.asarray(gt['t']); Rg_all = Rotation.from_quat(gt['q'])
     slg = Slerp(tg, Rg_all)
     t_v = np.array([sn for _, sn, _, _ in vio], np.int64); P_v = np.array([p for _, _, p, _ in vio])
@@ -451,7 +452,7 @@ def gnss_ins_alignment(vio, gt_bag, platform, mags=None, gps_records=None, rte_w
     traj = AlignedTrajectory(stamp + off, stamp, pos_al, rot_al, True, 'gnss-ins')
     out_poses = [(int(stamp[i] + off), int(stamp[i]), gt['p'][kk] - gt['p'][k[0]], Rg_all[kk]) for i, kk in enumerate(k)]
     sd_h = np.degrees(np.asarray(gt['sd_att'])[:, 2])
-    info = {'align_method': 'gnss-ins', 'align_yaw_world_to_enu_deg': math.degrees(theta),
+    info = {'align_method': 'gnss-ins', 'align_yaw_world_to_enu_deg': math.degrees(theta), 'gnss_ins_height': height,
             'align_ground_window_s': platform.ground_window_s, 'gt_rate_hz': float(1.0 / np.median(np.diff(tg[k]))),
             'gnss_ins_gnss_lag_s': float(gt['lag']), 'gnss_ins_seed_coherence': float(gt['seed_coherence']),
             'gnss_ins_heading_sd_median_deg': float(np.median(sd_h)), 'gnss_ins_heading_sd_max_deg': float(sd_h.max()),
@@ -462,7 +463,7 @@ def gnss_ins_alignment(vio, gt_bag, platform, mags=None, gps_records=None, rte_w
           f"{platform.ground_window_s:.0f} s (heading sd median {np.median(sd_h):.2f}, max {sd_h.max():.2f} deg); VIO->GT body rotation "
           f"{'n/a' if he['handeye_angle_deg'] is None else format(he['handeye_angle_deg'], '.2f')} deg (hand-eye, {he['handeye_pairs']} pairs"
           f"{'' if he.get('handeye_resid_deg') is None else ', resid ' + format(he['handeye_resid_deg'], '.2f') + ' deg'}); "
-          f"GT {len(k)} poses at {info['gt_rate_hz']:.0f} Hz")
+          f"GT {len(k)} poses at {info['gt_rate_hz']:.0f} Hz, height from {'Doppler' if height == 'doppler' else 'GNSS altitude'}")
     # magnetometer cross-check (ezio): how far the ground-mag heading is from the GNSS/INS one
     if mags is not None and len(mags) and gps_records:
         try:
@@ -583,6 +584,7 @@ def compute_alignment(
     align_origin_s: float = 5.0,
     gt_bag: str | None = None,
     rte_window_ns: int = 1_000_000_000,
+    gt_height: str | None = None,
 ) -> tuple:
     """Load ground-truth + VIO data and compute raw + aligned trajectories.
 
@@ -688,7 +690,8 @@ def compute_alignment(
             raise ValueError('gnss-ins: no VIO poses')
         vf = _decode_posimus(posimus)
         recs = _navsatfix_records_noyaw(fixes) if fixes else []
-        traj, out_poses, info = gnss_ins_alignment(vf, gt_bag, platform, np.array(mags) if mags else None, recs, rte_window_ns)
+        traj, out_poses, info = gnss_ins_alignment(vf, gt_bag, platform, np.array(mags) if mags else None, recs, rte_window_ns,
+                                                   height=gt_height)
         LAST_ALIGN_INFO = info
         print(f'Emitted {len(out_poses)} ground-truth poses, {len(traj)} aligned poses')
         return (out_poses, traj, posimus, typestore, reader_path,

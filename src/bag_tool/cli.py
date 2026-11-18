@@ -168,6 +168,12 @@ def main() -> None:
     )
     align_parser.add_argument("input_bag", help="Bag with RTK + VIO data to align")
     align_parser.add_argument(
+        "--gt-height", choices=["gnss", "doppler"], default=None,
+        help="gnss-ins only: where the ground-truth height comes from (default: the platform's, doppler on ezio). gnss = receiver altitude; "
+             "doppler = integrated Doppler vertical velocity (+ zero velocity on the ground), receiver altitude unused -- "
+             "for receivers whose altitude slips (u-blox M8N on ezio: -6 m on 16-26). Cached separately.",
+    )
+    align_parser.add_argument(
         "--gt-bag", default=None,
         help="Original recording, for --align-method gnss-ins: its IMU + GNSS PVT are smoothed into a full-pose "
              "ground truth (cached per recording, ~/.cache/bag-tool/gnss_ins).",
@@ -791,7 +797,8 @@ def main() -> None:
                   rte_window=args.rte_window, eval_mode=args.eval, manual=args.manual,
                   shrink=args.shrink, platform=platform, yaw_rot=args.yaw_rot,
                   out_suffix=args.out_suffix, align_method=method,
-                  align_origin_s=args.align_origin_s, gt_bag=args.gt_bag)
+                  align_origin_s=args.align_origin_s, gt_bag=args.gt_bag,
+                  gt_height=args.gt_height)
         if getattr(args, "scale", False):
             from pathlib import Path as _P
             out = args.out_suffix or "_aligned"

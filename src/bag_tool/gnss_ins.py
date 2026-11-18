@@ -121,7 +121,12 @@ def _seed_lag_heading(t_steps, dth, dvb, R0, bg0, G, pvt_t, v_enu, lags=np.arang
 
 # ---------------------------------------------------------------------------------------------- smoother
 def smooth(imu, pvt, rate=100.0, acc_n=0.03, gyr_n=1e-3, rw_acc=3e-4, rw_gyr=3e-5,
-           vel_sigma=(0.05, 0.10), pos_scale=2.0, verbose=True):
+           vel_sigma=(0.05, 0.10), pos_scale=2.0, height='gnss', verbose=True):
+    """height: 'gnss' = GNSS position update in 3-D (receiver altitude, sigma = pos_scale * v_acc);
+    'doppler' = horizontal position only: height comes from the Doppler vertical velocity (+ zero velocity while
+    still), anchored at the first fix. Use it when the receiver altitude slips (u-blox M8N: -6 m over 16-26)."""
+    if height not in ('gnss', 'doppler'):
+        raise ValueError(f"gnss_ins height must be 'gnss' or 'doppler', not {height!r}")
     lat0, lon0, h0 = math.radians(pvt['lat'][0]), math.radians(pvt['lon'][0]), pvt['h'][0]
     G = 9.780327 * (1 + 0.0053024 * math.sin(lat0) ** 2 - 0.0000058 * math.sin(2 * lat0) ** 2) - 3.086e-6 * h0
     OM = 7.2921159e-5 * np.array([0, math.cos(lat0), math.sin(lat0)])
@@ -212,7 +217,10 @@ def smooth(imu, pvt, rate=100.0, acc_n=0.03, gyr_n=1e-3, rw_acc=3e-4, rw_gyr=3e-
                 update(vg[gi] - (st['v'] + Rl), H, np.diag([vel_sigma[0] ** 2] * 2 + [vel_sigma[1] ** 2]), 'vel')
                 R = st['R']; Rl = R @ st['l']
                 H = np.zeros((3, NS)); H[:, 0:3] = I3; H[:, 6:9] = -_skew(Rl); H[:, 15:18] = R
-                update(pg[gi] - (st['p'] + Rl), H, np.diag(sig_p[gi] ** 2), 'pos')
+                if height == 'doppler':              # horizontal only: the receiver altitude is not used
+                    update((pg[gi] - (st['p'] + Rl))[:2], H[:2], np.diag(sig_p[gi, :2] ** 2), 'pos')
+                else:
+                    update(pg[gi] - (st['p'] + Rl), H, np.diag(sig_p[gi] ** 2), 'pos')
             gi += 1
         if still[k] and k % 10 == 0:
             i0, i1 = idx[k - 9 if k >= 9 else 0], idx[k + 1]
@@ -241,18 +249,20 @@ def smooth(imu, pvt, rate=100.0, acc_n=0.03, gyr_n=1e-3, rw_acc=3e-4, rw_gyr=3e-
     return {'t': edges, 'p': Xs[:, 0:3], 'v': Xs[:, 3:6], 'q': Rot.from_matrix(Rs).as_quat(),
             'ba': Xs[:, 6:9], 'bg': Xs[:, 9:12], 'lever': Xs[-1, 12:15], 'sd_att': sd[:, 6:9], 'still': np.r_[still, still[-1]],
             'lag': lag, 'yaw_seed': yaw, 'seed_coherence': coh, 'G': G, 'nis_vel': nis_v, 'nis_pos': nis_p,
-            'origin_lla': np.array([pvt['lat'][0], pvt['lon'][0], h0])}
+            'origin_lla': np.array([pvt['lat'][0], pvt['lon'][0], h0]), 'height': height,
+            'gnss_height_minus_smoother_end_m': float((pg[-1, 2]) - np.interp(pvt['t'][-1] - lag, edges, Xs[:, 2]))}
 
 
 # ---------------------------------------------------------------------------------------------- cache
-def ground_truth(bag: str | Path, imu_topic: str, pvt_topic: str, cache_dir: str | Path | None = None, verbose=True):
+def ground_truth(bag: str | Path, imu_topic: str, pvt_topic: str, cache_dir: str | Path | None = None, verbose=True,
+                 height: str = 'gnss'):
     """Smoothed GT for a recording (cached). Keys: t (s, IMU header clock), p (ENU, m, IMU position), q (xyzw, IMU body ->
     ENU), sd_att (rad, world-frame attitude sigma; [:, 2] = heading), plus diagnostics."""
     path = Path(bag)
     rpath = path.parent if path.is_file() else path
     files = sorted(rpath.glob('*.mcap')) if rpath.is_dir() else [rpath]
     key = hashlib.md5('|'.join([f'{f.name}:{f.stat().st_size}' for f in files] + [imu_topic, pvt_topic,
-                                str(CACHE_VERSION)]).encode()).hexdigest()[:12]
+                                str(CACHE_VERSION)] + ([] if height == 'gnss' else [f'height={height}'])).encode()).hexdigest()[:12]
     cdir = Path(cache_dir or os.path.join(os.path.expanduser('~'), '.cache', 'bag-tool', 'gnss_ins'))
     cdir.mkdir(parents=True, exist_ok=True)
     cfile = cdir / f'{rpath.name}_{key}.npz'
@@ -264,7 +274,7 @@ def ground_truth(bag: str | Path, imu_topic: str, pvt_topic: str, cache_dir: str
     if verbose:
         print(f'gnss-ins: reading {imu_topic} + {pvt_topic} from {rpath} ...')
     imu, pvt = load_inputs(rpath, imu_topic, pvt_topic)
-    out = smooth(imu, pvt, verbose=verbose)
+    out = smooth(imu, pvt, height=height, verbose=verbose)
     np.savez(cfile, **out)
     if verbose:
         print(f'gnss-ins: wrote {cfile}')
