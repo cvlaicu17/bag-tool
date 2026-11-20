@@ -24,7 +24,7 @@ class PlatformConfig:
     # of the same sensor's output (e.g., altair supports both PoseStamped and
     # PointStamped flavors of /pf_geo_loc/fc_local_position).
     gps_msg_types: tuple[str, ...]
-    yaw_source: Literal['rtk_topic', 'pose_quaternion', 'mag_ground']
+    yaw_source: Literal['rtk_topic', 'pose_quaternion', 'mag_ground', 'none']
     yaw_topic: str | None
     coord_frame: Literal['geodetic', 'ned', 'enu']
     position_frame_offset_rad: float
@@ -62,6 +62,10 @@ class PlatformConfig:
     # gnss-ins height source: 'gnss' = receiver altitude in the position update; 'doppler' = horizontal position only,
     # height from the Doppler vertical velocity (align --gt-height overrides)
     gnss_ins_height: str = 'gnss'
+    # 'none' platforms (position-only GPS, no heading, no magnetometer: orqa). gt_clock_imu_topic: GPS stamps follow the system (log)
+    # clock while IMU/camera stamps are sensor-clock (orqa_12's system clock stepped +127.2 s mid-flight), so each fix is re-stamped
+    # with (imu_header_stamp - imu_log_time) interpolated at the fix's log time (offset ~0 on normal bags).
+    gt_clock_imu_topic: str | None = None
 
 
 PLATFORMS: dict[str, PlatformConfig] = {
@@ -164,6 +168,23 @@ PLATFORMS: dict[str, PlatformConfig] = {
         # GT height from the Doppler vertical velocity (2026-11-19): the M8N receiver altitude slips (ended 5.5 m below
         # take-off on 16-26-48 while baro, Doppler height and the VIO all agreed on ~0) -> fake VIO vertical drift.
         gnss_ins_height='doppler',
+    ),
+    # orqa (altair airframe, FC GPS only): /fc/gps NavSatFix, no attitude, no magnetometer. Alignment 'gps-early' (bag_tool.gps_early_align):
+    # yaw + translation fitted on an early prefix of the flight, gate chosen from the GPS geometry and noise, see that module.
+    # Pass the original recording with --gt-bag: the GPS (and the IMU header/log clock offsets) are read from it when the VIO bag has no /fc/gps.
+    'orqa': PlatformConfig(
+        name='orqa',
+        gps_topic='/fc/gps',
+        gps_msg_types=('sensor_msgs/msg/NavSatFix',),
+        yaw_source='none',
+        yaw_topic=None,
+        coord_frame='geodetic',
+        position_frame_offset_rad=0.0,
+        detect_topics=('/fc/gps', '/altimeter/range', '/imu/data_raw'),
+        aruco_supported=False,
+        emit_raw_rtk_topics=False,
+        default_align_method='gps-early',
+        gt_clock_imu_topic='/imu/data_raw',
     ),
 }
 

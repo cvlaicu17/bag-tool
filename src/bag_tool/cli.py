@@ -236,8 +236,8 @@ def main() -> None:
              "Use to compensate for unknown IMU mounting orientation in the sensor casket.",
     )
     align_parser.add_argument(
-        "--align-method", choices=["first-fix", "dynamic", "ground-mag", "gnss-ins"], default=None,
-        help="default: the platform's (altair: dynamic; prince, alexios: first-fix; ezio: gnss-ins). "
+        "--align-method", choices=["first-fix", "dynamic", "ground-mag", "gnss-ins", "gps-early"], default=None,
+        help="default: the platform's (altair: dynamic; prince, alexios: first-fix; ezio: gnss-ins; orqa: gps-early). "
              "Every method outputs the whole ground truth as a trajectory in the VIO frame; the scorer then computes "
              "ATE, RTE (1-s relative-pose drift; needs a ground truth with attitude) and RTE-D (the |ATE| rate). "
              "gnss-ins (ezio): GNSS/INS smoother over the original recording (--gt-bag) -> full-pose ground truth; "
@@ -247,7 +247,10 @@ def main() -> None:
              "(no heading needed; ~0.6° vs landmark truth; needs ~90 s of manoeuvring flight after take-off) and remove "
              "the GT-vs-VIO clock offset. Falls back to first-fix, with a warning, when it cannot be determined. "
              "ground-mag (ezio): position + yaw from the static ground window only -- mean GNSS fix and the calibrated "
-             "magnetometer (pass /mag/field through to the result bag); no trajectory fit.",
+             "magnetometer (pass /mag/field through to the result bag); no trajectory fit. "
+             "gps-early (orqa, default there): position-only /fc/gps, no heading. Yaw + translation fitted on an EARLY prefix of the flight "
+             "(first prefix = earliest with enough horizontal baseline for the GPS noise, then growing prefixes until a larger fit degrades "
+             "an earlier one), so later drift is not absorbed by the alignment. Pass the original recording with --gt-bag.",
     )
     align_parser.add_argument(
         "--align-origin-s", type=float, default=5.0, metavar="SEC",

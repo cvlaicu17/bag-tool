@@ -401,6 +401,39 @@ def _trajectory_from_records(out_aligned, out_poses, has_attitude, source, align
     return traj
 
 
+def _fixes_for_position_only(fixes, platform, typestore, gt_bag, reader_path):
+    """Position-only GPS platforms (orqa): take /fc/gps from --gt-bag when the VIO bag has none, then move every fix into the sensor
+    clock with the IMU (header stamp - log time) offset, see PlatformConfig.gt_clock_imu_topic."""
+    import struct
+    src = Path(gt_bag) if gt_bag else None
+    if src is not None:
+        src = src.parent if src.is_file() else src
+    need = [] if fixes else [platform.gps_topic]
+    imu_topic = platform.gt_clock_imu_topic
+    lg, of = [], []
+    for rp in [r for r in (src, Path(reader_path)) if r is not None]:
+        with Reader(rp) as r:
+            topics = {c.topic for c in r.connections}
+            cons = [c for c in r.connections if (c.topic in need and not fixes) or (imu_topic and c.topic == imu_topic and not lg)]
+            if not cons:
+                continue                                            # an empty list would make rosbags read EVERY topic
+            for c, t_ns, raw in r.messages(connections=cons):
+                if c.topic == imu_topic:
+                    s_, n_ = struct.unpack_from('<iI', raw, 4)         # header stamp straight from the CDR bytes
+                    lg.append(t_ns * 1e-9); of.append(s_ + n_ * 1e-9 - t_ns * 1e-9)
+                else:
+                    fixes.append((t_ns, typestore.deserialize_cdr(raw, c.msgtype)))
+    if fixes and lg:
+        lg, of = np.array(lg[::50]), np.array(of[::50])
+        for fix_ts, m in fixes:
+            ns = int(round(fix_ts + float(np.interp(fix_ts * 1e-9, lg, of)) * 1e9))
+            m.header.stamp.sec, m.header.stamp.nanosec = ns // 10**9, ns % 10**9
+        print(f'GPS stamps moved into the sensor clock (IMU offset {min(of):+.3f}..{max(of):+.3f} s)')
+    elif fixes and imu_topic:
+        print(f'WARNING: no {imu_topic} to map the GPS clock into the sensor clock (set --gt-bag to the original recording)')
+    return fixes
+
+
 def gnss_ins_alignment(vio, gt_bag, platform, mags=None, gps_records=None, rte_window_ns=1_000_000_000, height=None):
     """'gnss-ins' alignment: the ground truth is a GNSS/INS smoother over the ORIGINAL recording (bag_tool.gnss_ins,
     nothing from the VIO enters it), i.e. a full 6-DoF trajectory. Steps:
@@ -675,6 +708,8 @@ def compute_alignment(
                         diag_tracking.append((header_ns, int(float(kv.value))))
                         break
 
+    if platform.yaw_source == 'none':
+        fixes = _fixes_for_position_only(fixes, platform, typestore, gt_bag, reader_path)
     fixes.sort(key=lambda x: x[0])
     yaws.sort(key=lambda x: x[0])
     gt_poses.sort(key=lambda x: x[0])
@@ -700,7 +735,10 @@ def compute_alignment(
     # Dispatch by which list is populated (driven by the actual bag's msgtype, not the
     # platform's default). A bag should contain only one of these — if both poses and
     # points exist, prefer poses (more information).
-    if fixes and platform.yaw_source == 'mag_ground':
+    if fixes and platform.yaw_source == 'none':
+        print(f'Loaded {len(fixes)} fixes (position-only, no heading), {len(posimus)} VIO poses')
+        gps_records = _navsatfix_records_noyaw(fixes)
+    elif fixes and platform.yaw_source == 'mag_ground':
         print(f'Loaded {len(fixes)} fixes, {len(mags)} magnetometer samples, {len(posimus)} VIO poses')
         gps_records = _navsatfix_records_noyaw(fixes)
     elif fixes:
@@ -778,6 +816,28 @@ def compute_alignment(
         LAST_ALIGN_INFO = {'align_method': 'ground-mag', 'align_yaw_world_to_enu_deg': math.degrees(dyn['theta_rad']),
                            'align_yaw_spread_deg': dyn['yaw_spread_deg'], 'align_ground_window_s': dyn['window_s'],
                            'align_gnss_ground_std_m': dyn['gnss_std_m'], 'align_n_mag': dyn['n_mag'], 'align_n_fix': dyn['n_fix']}
+    if align_method == 'gps-early':
+        if not (gps_records and posimus):
+            print('WARNING: --align-method gps-early needs ground truth and VIO poses -> using first-fix')
+        else:
+            from bag_tool.gps_early_align import estimate_alignment as _early
+            vf = _decode_posimus(posimus)
+            cov = [m.position_covariance[0] for _, m in fixes if m.position_covariance_type >= 2 and m.position_covariance[0] > 0]
+            sig_h = float(np.sqrt(np.median(cov))) if cov else None
+            dyn = _early(np.array([sn for _, sn, _, _ in vf]) * 1e-9, np.array([p for _, _, p, _ in vf]),
+                         np.array([sn for _, sn, _, _ in gps_records]) * 1e-9, np.array([p for _, _, p, _ in gps_records]), sigma_h=sig_h)
+            if dyn['ok']:
+                print(f"GPS early-prefix alignment: yaw (VIO world -> ENU) {math.degrees(dyn['theta_rad']):+.2f}° (whole-flight fit "
+                      f"{dyn['yaw_global_deg']:+.2f}°), fitted on the first {dyn['fit_end_s']:.0f} s of {dyn['flight_s']:.0f} s "
+                      f"(fit rms {dyn['fit_rms_m']:.2f} m); gate at {dyn['gate_t_s']:.0f} s, sigma_h {dyn['sigma_h']:.2f} m; stop: {dyn['stop']}")
+                LAST_ALIGN_INFO = {'align_method': 'gps-early', 'align_yaw_world_to_enu_deg': math.degrees(dyn['theta_rad']),
+                                   'align_yaw_global_deg': dyn['yaw_global_deg'], 'align_fit_end_s': dyn['fit_end_s'],
+                                   'align_flight_s': dyn['flight_s'], 'align_fit_frac': dyn['fit_frac'], 'align_fit_rms_m': dyn['fit_rms_m'],
+                                   'align_gate_t_s': dyn['gate_t_s'], 'align_sigma_h_m': dyn['sigma_h'], 'align_stop': dyn['stop']}
+            else:
+                reason = dyn['reason']
+                print(f"WARNING: gps-early alignment not possible ({reason}) -> falling back to first-fix"); dyn = None
+                LAST_ALIGN_INFO = {'align_method': 'first-fix (gps-early failed)', 'align_failure': reason}
     if align_method == 'dynamic':
         if not (gps_records and posimus):
             print('WARNING: --align-method dynamic needs ground truth and VIO poses -> using first-fix')
